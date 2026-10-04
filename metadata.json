@@ -1,0 +1,14 @@
+{
+  "name": "Nexus",
+  "description": "An AI companion, Nexus, that communicates exclusively through voice. Nexus features a witty, uncensored personality, remembers all interactions, and can perform a wide range of tasks.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera",
+    "display-capture",
+    "clipboard-read",
+    "clipboard-write"
+  ],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
