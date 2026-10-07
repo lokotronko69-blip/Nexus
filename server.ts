@@ -248,9 +248,19 @@ case "\$1" in
     echo "Clave GEMINI_API_KEY actualizada en tiempo real y servicio Nexus reiniciado."
     ;;
   app|"")
+    systemctl is-active --quiet "\$SERVICE" 2>/dev/null || sudo systemctl start "\$SERVICE" 2>/dev/null || true
     BROWSER_BIN=\$(command -v chromium || command -v google-chrome || command -v firefox-esr || echo "xdg-open")
     if [[ "\$BROWSER_BIN" == *"chromium"* ]] || [[ "\$BROWSER_BIN" == *"chrome"* ]]; then
-      "\$BROWSER_BIN" --app="http://localhost:\$PORT" --use-fake-ui-for-media-stream --enable-features=WebRTCPipeWireCapturer --start-maximized >/dev/null 2>&1 &
+      CHROME_FLAGS=(--app="http://localhost:\$PORT" --use-fake-ui-for-media-stream --enable-features=WebRTCPipeWireCapturer --start-maximized)
+      if [ "\$(id -u)" -eq 0 ]; then
+        if [ -n "\$SUDO_USER" ] && [ "\$SUDO_USER" != "root" ]; then
+          sudo -u "\$SUDO_USER" DISPLAY="\${DISPLAY:-:0}" "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
+        else
+          "\$BROWSER_BIN" --no-sandbox --user-data-dir="/root/.config/nexus-chromium" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
+        fi
+      else
+        "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
+      fi
     else
       "\$BROWSER_BIN" "http://localhost:\$PORT" >/dev/null 2>&1 &
     fi
@@ -269,13 +279,22 @@ case "\$1" in
 esac`;
 }
 
-function isPlaceholderOrProxyKey(key: string | undefined | null, forExternalInstaller = false): boolean {
+function isPlaceholderOrProxyKey(key: string | undefined | null, _forExternalInstaller = false): boolean {
   if (!key) return true;
   const clean = key.trim().replace(/^["']|["']$/g, '');
-  if (!clean || clean === 'TU_CLAVE_GEMINI_AQUI' || clean === 'TU_CLAVE_AQUI' || clean === 'undefined' || clean === 'null') {
-    return true;
-  }
-  if (forExternalInstaller && clean.startsWith('AQ.')) {
+  if (
+    !clean ||
+    clean === 'MY_GEMINI_API_KEY' ||
+    clean === 'GEMINI_API_KEY' ||
+    clean === 'API_KEY' ||
+    clean === 'YOUR_API_KEY' ||
+    clean === 'YOUR_GEMINI_API_KEY' ||
+    clean === 'TU_CLAVE_GEMINI_AQUI' ||
+    clean === 'TU_CLAVE_AQUI' ||
+    clean === 'undefined' ||
+    clean === 'null' ||
+    clean.startsWith('AQ.')
+  ) {
     return true;
   }
   return false;
@@ -713,8 +732,9 @@ rm -rf "\$STAGING_DIR"
 mkdir -p "\$STAGING_DIR"
 tar -xzf "\$PAYLOAD_TAR" -C "\$STAGING_DIR"
 
-# Preservar .env intacto en staging para la compilación
+# Preservar .env intacto en staging para la compilación (limpiando tokens internos AQ.* o placeholders)
 if [ -f "\$ENV_FILE" ]; then
+  sed -i 's|^GEMINI_API_KEY="AQ\.[^"]*"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="TU_CLAVE[^"]*"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="MY_GEMINI_API_KEY"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="GEMINI_API_KEY"|GEMINI_API_KEY=""|g' "\$ENV_FILE" 2>/dev/null || true
   cp -a "\$ENV_FILE" "\${STAGING_DIR}/.env"
 else
   cat << ENVEOF > "\${STAGING_DIR}/.env"
@@ -878,7 +898,7 @@ NEXUS_API_KEY="\${NEXUS_API_KEY:-\${GEMINI_API_KEY:-${activeApiKey}}}"
 # Preservar clave previa si ya existía en /opt/nexus/.env
 if [ -z "\$NEXUS_API_KEY" ] && [ -f /opt/nexus/.env ]; then
   EXISTING_KEY=\$(grep -E '^GEMINI_API_KEY=' /opt/nexus/.env 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-  if [ -n "\$EXISTING_KEY" ] && [ "\$EXISTING_KEY" != "TU_CLAVE_GEMINI_AQUI" ] && [[ "\$EXISTING_KEY" != AQ.* ]]; then
+  if [ -n "\$EXISTING_KEY" ] && [ "\$EXISTING_KEY" != "TU_CLAVE_GEMINI_AQUI" ] && [ "\$EXISTING_KEY" != "MY_GEMINI_API_KEY" ] && [ "\$EXISTING_KEY" != "GEMINI_API_KEY" ] && [[ "\$EXISTING_KEY" != AQ.* ]]; then
     NEXUS_API_KEY="\$EXISTING_KEY"
   fi
 fi
@@ -1109,7 +1129,7 @@ NEXUS_API_KEY="\${NEXUS_API_KEY:-\${GEMINI_API_KEY:-${activeApiKey}}}"
 
 if [ -z "\$NEXUS_API_KEY" ] && [ -f /opt/nexus/.env ]; then
   EXISTING_KEY=\$(grep -E '^GEMINI_API_KEY=' /opt/nexus/.env 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-  if [ -n "\$EXISTING_KEY" ] && [ "\$EXISTING_KEY" != "TU_CLAVE_GEMINI_AQUI" ] && [[ "\$EXISTING_KEY" != AQ.* ]]; then
+  if [ -n "\$EXISTING_KEY" ] && [ "\$EXISTING_KEY" != "TU_CLAVE_GEMINI_AQUI" ] && [ "\$EXISTING_KEY" != "MY_GEMINI_API_KEY" ] && [ "\$EXISTING_KEY" != "GEMINI_API_KEY" ] && [[ "\$EXISTING_KEY" != AQ.* ]]; then
     NEXUS_API_KEY="\$EXISTING_KEY"
   fi
 fi

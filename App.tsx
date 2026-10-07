@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { LiveServerMessage } from '@google/genai';
-import { Monitor, MonitorOff, Video, VideoOff, Brain, Trash2, Settings, Cpu, Activity, Globe, Save, CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react';
+import { Monitor, MonitorOff, Video, VideoOff, Brain, Trash2, Settings, Cpu, Activity, Globe, Save, CheckCircle2, AlertCircle, RefreshCw, Terminal, Package, FileText } from 'lucide-react';
 import { connectToNexus, performComplexTask, getWebSearchResult, NexusFunctionDeclarations, executeDynamicCode, generateImage, LiveSession, saveMemoryToStorage, loadMemories, getAllMemoriesFromStorage, getMemoriesArray, deleteMemory, clearAllMemories, executeCyberSecurityTool, saveTranscript, setCurrentNexusVoice, getCurrentNexusVoice, resetToDefaultNexusVoice, DEFAULT_NEXUS_VOICE } from './services/geminiService';
 import type { NexusStatus } from './types';
 import { VoiceVisualizer } from './components/VoiceVisualizer';
@@ -1523,337 +1523,6 @@ export const App: React.FC = () => {
         }
     }, [startCamera, stopCamera, startScreenShare, stopScreenShare, startRecording, stopRecording]);
 
-    const connect = useCallback(async () => {
-        // Ensure clean slate
-        handleDisconnect();
-        
-        if (!navigator.onLine) {
-            setLastError("No hay conexión a internet. Por favor, revisa tu red.");
-            setNexusStatus('OFFLINE');
-            return;
-        }
-
-        setNexusStatus('CONNECTING');
-        setLastError(null);
-        try {
-            // Request Mic Permission FIRST, before any await, to ensure user gesture is preserved
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                setLastError("Tu navegador no soporta el acceso al micrófono. Asegúrate de estar usando una conexión segura (HTTPS).");
-                handleDisconnect();
-                return;
-            }
-
-            let stream: MediaStream;
-            try {
-                stream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                        channelCount: 1,
-                        sampleRate: 16000
-                    } 
-                });
-            } catch (e: any) {
-                console.warn("Error accessing microphone:", e);
-                const errorMsg = e.message || e.name || String(e);
-                
-                if (e.name === 'NotAllowedError' || errorMsg.toLowerCase().includes('permission denied')) {
-                    setLastError("Permiso de micrófono denegado. Por favor, actívalo en tu navegador (haz clic en el icono del candado en la barra de direcciones).");
-                } else if (e.name === 'NotFoundError' || errorMsg.toLowerCase().includes('not found')) {
-                    setLastError("No se encontró ningún micrófono en tu dispositivo.");
-                } else {
-                    setLastError(`Error al acceder al micrófono: ${errorMsg}`);
-                }
-                handleDisconnect();
-                return;
-            }
-            
-            streamRef.current = stream;
-
-            // Initialize Audio Contexts
-            // Requesting 16k for input, but browser might override
-            const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-            const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-            
-            inputAudioContextRef.current = inputCtx;
-            outputAudioContextRef.current = outputCtx;
-
-            // CRITICAL: Resume contexts immediately within the user gesture
-            await Promise.all([
-                outputCtx.state === 'suspended' ? outputCtx.resume() : Promise.resolve(),
-                inputCtx.state === 'suspended' ? inputCtx.resume() : Promise.resolve()
-            ]);
-
-            // Setup Output Analyser
-            const analyser = outputCtx.createAnalyser();
-            analyser.fftSize = 256;
-            const outputGain = outputCtx.createGain();
-            analyser.connect(outputGain);
-            outputGain.connect(outputCtx.destination);
-            
-            // Create a mix for recording (AI output + Mic input)
-            const recordingDestination = outputCtx.createMediaStreamDestination();
-            analyser.connect(recordingDestination); // AI audio
-            try {
-                const micSource = outputCtx.createMediaStreamSource(stream);
-                micSource.connect(recordingDestination); // Mic audio
-                micSourceRef.current = micSource;
-            } catch (e) {
-                console.warn("Could not connect mic to recording destination:", e);
-            }
-            recordingDestinationRef.current = recordingDestination;
-
-            outputAnalyserRef.current = analyser;
-            setOutputAnalyser(analyser);
-            
-            // Reset playback state
-            nextStartTimeRef.current = 0;
-            sourcesRef.current.clear();
-
-            let sessionPromise;
-            try {
-                sessionPromise = connectToNexus({
-                    onopen: () => {
-                        console.log('Conexión abierta.');
-                    },
-                    onmessage: handleMessage,
-                    onerror: (e: ErrorEvent) => {
-                        console.error('Error de conexión:', e);
-                        setLastError(`Error de red o de WebSocket. Intentando reconectar...`);
-                        handleDisconnect();
-                        // Auto-reconnect after a short delay
-                        setTimeout(() => {
-                            if (navigator.onLine) {
-                                connect().catch(err => console.error("Reconnection error (onerror):", err));
-                            }
-                        }, 2000);
-                    },
-                    onclose: (e: CloseEvent) => {
-                        console.log('Conexión cerrada:', e.code, e.reason);
-                        if (e.code === 1008 || /API_KEY|authentication|credential/i.test(String(e.reason || ''))) {
-                            setLastError(null);
-                            setNexusStatus('LISTENING');
-                            startOfflineRecognition();
-                            return;
-                        }
-                        if(e.code !== 1000) {
-                            let reason = e.reason || "Desconocida";
-                            if (e.code === 1006) reason = "Conexión interrumpida anormalmente (posible caída de red o error del servidor).";
-                            if (e.code === 1011) reason = "El servidor encontró un error interno.";
-                            setLastError(`Conexión cerrada (Código: ${e.code}). Razón: ${reason}. Reconectando automáticamente...`);
-                        }
-                        handleDisconnect();
-                        // Always reconnect
-                        setTimeout(() => {
-                            if (navigator.onLine) {
-                                connect().catch(err => console.error("Reconnection error (onclose):", err));
-                            }
-                        }, 2000);
-                    },
-                });
-                
-                sessionPromiseRef.current = sessionPromise;
-                sessionRef.current = await sessionPromise;
-            } catch (connectionError: any) {
-                console.error("Failed to connect to Nexus:", connectionError);
-                let errorMessage = connectionError.message || "Error desconocido al conectar.";
-                
-                if (errorMessage.includes("API_KEY") || /UNAUTHENTICATED|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
-                    setLastError(null);
-                    setNexusStatus('LISTENING');
-                    startOfflineRecognition();
-                    return;
-                } else if (errorMessage.includes("The service is currently unavailable") || errorMessage.includes("503")) {
-                    errorMessage = "El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.";
-                } else if (errorMessage.includes("Network error") || errorMessage.toLowerCase().includes("network")) {
-                    errorMessage = "Hubo un problema de red al intentar conectar con los servidores. Verifica tu conexión a internet.";
-                }
-                
-                setLastError(`Error de conexión: ${errorMessage}`);
-                handleDisconnect();
-                return;
-            }
-
-            // Now setup the audio processing pipeline
-            const inputAudioContext = inputAudioContextRef.current;
-            if (!stream || !inputAudioContext) return;
-            
-            const source = inputAudioContext.createMediaStreamSource(stream);
-            const inputAnalyserNode = inputAudioContext.createAnalyser();
-            inputAnalyserNode.fftSize = 512;
-            setInputAnalyser(inputAnalyserNode);
-
-            // Use AudioWorklet instead of deprecated ScriptProcessorNode for better performance
-            // Do downsampling and Int16 conversion directly in the worklet
-            const workletCode = `
-            class PCMProcessor extends AudioWorkletProcessor {
-                constructor(options) {
-                    super();
-                    this.sourceRate = options.processorOptions.sampleRate;
-                    this.targetRate = 16000;
-                    this.ratio = this.sourceRate / this.targetRate;
-                    // Send 4096 samples at a time
-                    this.bufferSize = 4096;
-                    this.outBuffer = new Int16Array(this.bufferSize);
-                    this.outBufferIndex = 0;
-                    this.inputOffset = 0;
-                }
-                process(inputs, outputs, parameters) {
-                    const input = inputs[0];
-                    if (input && input.length > 0 && input[0]) {
-                        const channelData = input[0];
-                        let i = this.inputOffset;
-                        
-                        while (Math.floor(i) < channelData.length) {
-                            const index = Math.floor(i);
-                            const s = Math.max(-1, Math.min(1, channelData[index]));
-                            this.outBuffer[this.outBufferIndex++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                            
-                            if (this.outBufferIndex >= this.bufferSize) {
-                                this.port.postMessage(this.outBuffer.slice());
-                                this.outBufferIndex = 0;
-                            }
-                            
-                            i += this.ratio;
-                        }
-                        
-                        // save fractional offset for next buffer
-                        this.inputOffset = i - channelData.length;
-                    }
-                    return true;
-                }
-            }
-            registerProcessor('pcm-processor', PCMProcessor);
-            `;
-            const blob = new Blob([workletCode], { type: 'application/javascript' });
-            const url = URL.createObjectURL(blob);
-            
-            await inputAudioContext.audioWorklet.addModule(url);
-            const workletNode = new AudioWorkletNode(inputAudioContext, 'pcm-processor', {
-                processorOptions: {
-                    sampleRate: inputAudioContext.sampleRate
-                }
-            });
-            
-            // Store reference to disconnect later
-            audioWorkletRef.current = workletNode;
-
-            workletNode.port.onmessage = (e) => {
-                const int16Data = e.data as Int16Array;
-                const targetRate = 16000;
-                
-                // Always send as 16k
-                const pcmBlob = {
-                    data: encode(new Uint8Array(int16Data.buffer)),
-                    mimeType: `audio/pcm;rate=${targetRate}`,
-                };
-                
-                // Send to session safely
-                if (sessionPromiseRef.current) {
-                    sessionPromiseRef.current.then(session => {
-                        session.sendRealtimeInput({ audio: pcmBlob });
-                    }).catch(() => {});
-                }
-            };
-            
-            source.connect(inputAnalyserNode);
-            inputAnalyserNode.connect(workletNode);
-            
-            // Keep alive
-            const gainNode = inputAudioContext.createGain();
-            gainNode.gain.setValueAtTime(0, inputAudioContext.currentTime);
-            workletNode.connect(gainNode);
-            gainNode.connect(inputAudioContext.destination);
-
-            // Everything is ready
-            setNexusStatus('LISTENING');
-            if ((sessionRef.current as any)?.isLocalSession) {
-                setLastError(null);
-                startOfflineRecognition();
-                if ((window as any).nexus?.speak) {
-                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy instalada y activa en tu sistema Linux. Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos cuando quieras.");
-                }
-            }
-
-        } catch (error: any) {
-            console.warn('Failed to connect:', error);
-            let errorMessage = 'No se pudo conectar.';
-            
-            if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-                errorMessage = 'Necesitamos permiso para usar el micrófono.';
-            } else if (error.message?.includes('API_KEY')) {
-                setLastError(null);
-                setNexusStatus('LISTENING');
-                startOfflineRecognition();
-                return;
-            } else if (error.message?.includes('The service is currently unavailable') || error.message?.includes('503')) {
-                errorMessage = 'El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.';
-            } else if (error.message?.includes('Network error') || error.message?.toLowerCase().includes('network')) {
-                errorMessage = 'Hubo un problema de red al intentar conectar con los servidores. Verifica tu conexión a internet.';
-            } else if (error.message) {
-                errorMessage = `Error al conectar: ${error.message}`;
-            }
-
-            setLastError(errorMessage);
-            setNexusStatus('OFFLINE');
-            handleDisconnect();
-        }
-    }, [handleDisconnect, handleMessage]);
-
-    useEffect(() => {
-        const handleOnline = () => {
-            if (nexusStatus === 'OFFLINE' && lastError?.includes('internet')) {
-                setLastError(null);
-                if (hasGrantedAccess) {
-                    if (recognitionRef.current) {
-                        try { recognitionRef.current.stop(); } catch(e) {}
-                    }
-                    connect().catch(err => console.error("Online reconnection error:", err));
-                }
-            }
-        };
-
-        const handleOffline = () => {
-            setLastError("Se ha perdido la conexión a internet. Cambiando a Modo Local con LM Studio/Ollama si están configurados.");
-            setNexusStatus('OFFLINE');
-            handleDisconnect();
-            
-            // Hablar al desconectarse
-            if ((window as any).nexus && (window as any).nexus.speak) {
-                (window as any).nexus.speak("Se ha perdido la conexión a internet. Cambio a modo local.");
-            }
-            
-            // Iniciar reconocimiento offline
-            startOfflineRecognition();
-        };
-
-        const handleReconnect = () => {
-            if (hasGrantedAccess && navigator.onLine) {
-                setLastError("La sesión expiró por límite de tiempo. Reconectando...");
-                connect().catch(err => console.error("Reconnection error (event):", err));
-            }
-        };
-
-        window.addEventListener('online', handleOnline);
-        window.addEventListener('offline', handleOffline);
-        window.addEventListener('nexus-reconnect', handleReconnect);
-
-        // Si iniciamos y estamos offline, iniciar STT local directamente
-        if (!navigator.onLine && hasGrantedAccess) {
-            startOfflineRecognition();
-        }
-
-        return () => {
-            window.removeEventListener('online', handleOnline);
-            window.removeEventListener('offline', handleOffline);
-            window.removeEventListener('nexus-reconnect', handleReconnect);
-            if (recognitionRef.current) {
-                try { recognitionRef.current.stop(); } catch(e) {}
-            }
-        };
-    }, [nexusStatus, lastError, hasGrantedAccess, connect, handleDisconnect]);
-    
     // Función central para el modo local
     const startOfflineRecognition = useCallback(() => {
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -1891,10 +1560,10 @@ export const App: React.FC = () => {
                 }
                 return;
             }
-            if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete).*(debian|kali|linux)/i.test(lowerTranscript)) {
+            if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete|actualizar|actualizador).*(debian|kali|linux)/i.test(lowerTranscript)) {
                 setShowDebianPanel(true);
                 if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Aquí tienes el panel con el comando único de instalación en paquete para Debian y Kali Linux, Koko.");
+                    (window as any).nexus.speak("Aquí tienes el panel con el instalador y actualizador atómico para Debian y Kali Linux, Koko.");
                 }
                 return;
             }
@@ -2084,7 +1753,313 @@ export const App: React.FC = () => {
         } catch(e) {
             console.error("Error starting offline recognition", e);
         }
-    }, [nexusStatus, lmStudioUrl, ollamaUrl]);
+    }, [lmStudioUrl, ollamaUrl]);
+
+    const connect = useCallback(async () => {
+        // Ensure clean slate
+        handleDisconnect();
+        
+        if (!navigator.onLine) {
+            setLastError(null);
+            setNexusStatus('LISTENING');
+            startOfflineRecognition();
+            return;
+        }
+
+        setNexusStatus('CONNECTING');
+        setLastError(null);
+        try {
+            let stream: MediaStream;
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('getUserMedia not available');
+                }
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        channelCount: 1,
+                        sampleRate: 16000
+                    } 
+                });
+            } catch (firstMicErr: any) {
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } catch (e: any) {
+                    console.warn("Microphone unavailable or denied; creating virtual audio stream so Nexus starts cleanly:", e);
+                    const fallbackCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+                    const dest = fallbackCtx.createMediaStreamDestination();
+                    stream = dest.stream;
+                }
+            }
+            
+            streamRef.current = stream;
+
+            // Initialize Audio Contexts
+            // Requesting 16k for input, but browser might override
+            const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+            const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+            
+            inputAudioContextRef.current = inputCtx;
+            outputAudioContextRef.current = outputCtx;
+
+            // CRITICAL: Resume contexts immediately within the user gesture
+            await Promise.all([
+                outputCtx.state === 'suspended' ? outputCtx.resume() : Promise.resolve(),
+                inputCtx.state === 'suspended' ? inputCtx.resume() : Promise.resolve()
+            ]);
+
+            // Setup Output Analyser
+            const analyser = outputCtx.createAnalyser();
+            analyser.fftSize = 256;
+            const outputGain = outputCtx.createGain();
+            analyser.connect(outputGain);
+            outputGain.connect(outputCtx.destination);
+            
+            // Create a mix for recording (AI output + Mic input)
+            const recordingDestination = outputCtx.createMediaStreamDestination();
+            analyser.connect(recordingDestination); // AI audio
+            try {
+                if (stream.getAudioTracks().length > 0) {
+                    const micSource = outputCtx.createMediaStreamSource(stream);
+                    micSource.connect(recordingDestination); // Mic audio
+                    micSourceRef.current = micSource;
+                }
+            } catch (e) {
+                console.warn("Could not connect mic to recording destination:", e);
+            }
+            recordingDestinationRef.current = recordingDestination;
+
+            outputAnalyserRef.current = analyser;
+            setOutputAnalyser(analyser);
+            
+            // Reset playback state
+            nextStartTimeRef.current = 0;
+            sourcesRef.current.clear();
+
+            let sessionPromise;
+            try {
+                sessionPromise = connectToNexus({
+                    onopen: () => {
+                        console.log('Conexión abierta.');
+                    },
+                    onmessage: handleMessage,
+                    onerror: (e: ErrorEvent) => {
+                        console.warn('Aviso de WebSocket:', e);
+                    },
+                    onclose: (e: CloseEvent) => {
+                        console.log('Conexión cerrada:', e.code, e.reason);
+                        if (
+                            e.code === 1007 ||
+                            e.code === 1008 ||
+                            /API_KEY|API key|not valid|authentication|credential|permission|unauthenticated/i.test(String(e.reason || ''))
+                        ) {
+                            setLastError(null);
+                            setNexusStatus('LISTENING');
+                            startOfflineRecognition();
+                            return;
+                        }
+                        if (e.code !== 1000) {
+                            setLastError(null);
+                            setNexusStatus('LISTENING');
+                            startOfflineRecognition();
+                            return;
+                        }
+                        handleDisconnect();
+                    },
+                });
+                
+                sessionPromiseRef.current = sessionPromise;
+                sessionRef.current = await sessionPromise;
+            } catch (connectionError: any) {
+                console.error("Failed to connect to Nexus:", connectionError);
+                let errorMessage = connectionError.message || "Error desconocido al conectar.";
+                
+                if (errorMessage.includes("API_KEY") || /API key|not valid|UNAUTHENTICATED|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
+                    setLastError(null);
+                    setNexusStatus('LISTENING');
+                    startOfflineRecognition();
+                    return;
+                } else if (errorMessage.includes("The service is currently unavailable") || errorMessage.includes("503")) {
+                    errorMessage = "El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.";
+                } else if (errorMessage.includes("Network error") || errorMessage.toLowerCase().includes("network")) {
+                    errorMessage = "Hubo un problema de red al intentar conectar con los servidores. Verifica tu conexión a internet.";
+                }
+                
+                setLastError(`Error de conexión: ${errorMessage}`);
+                handleDisconnect();
+                return;
+            }
+
+            // Now setup the audio processing pipeline safely
+            const inputAudioContext = inputAudioContextRef.current;
+            if (stream && inputAudioContext && stream.getAudioTracks().length > 0) {
+                try {
+                    const source = inputAudioContext.createMediaStreamSource(stream);
+                    const inputAnalyserNode = inputAudioContext.createAnalyser();
+                    inputAnalyserNode.fftSize = 512;
+                    setInputAnalyser(inputAnalyserNode);
+
+                    const workletCode = `
+                    class PCMProcessor extends AudioWorkletProcessor {
+                        constructor(options) {
+                            super();
+                            this.sourceRate = options.processorOptions.sampleRate;
+                            this.targetRate = 16000;
+                            this.ratio = this.sourceRate / this.targetRate;
+                            this.bufferSize = 4096;
+                            this.outBuffer = new Int16Array(this.bufferSize);
+                            this.outBufferIndex = 0;
+                            this.inputOffset = 0;
+                        }
+                        process(inputs, outputs, parameters) {
+                            const input = inputs[0];
+                            if (input && input.length > 0 && input[0]) {
+                                const channelData = input[0];
+                                let i = this.inputOffset;
+                                
+                                while (Math.floor(i) < channelData.length) {
+                                    const index = Math.floor(i);
+                                    const s = Math.max(-1, Math.min(1, channelData[index]));
+                                    this.outBuffer[this.outBufferIndex++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                    
+                                    if (this.outBufferIndex >= this.bufferSize) {
+                                        this.port.postMessage(this.outBuffer.slice());
+                                        this.outBufferIndex = 0;
+                                    }
+                                    
+                                    i += this.ratio;
+                                }
+                                
+                                this.inputOffset = i - channelData.length;
+                            }
+                            return true;
+                        }
+                    }
+                    registerProcessor('pcm-processor', PCMProcessor);
+                    `;
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    const url = URL.createObjectURL(blob);
+                    
+                    await inputAudioContext.audioWorklet.addModule(url);
+                    const workletNode = new AudioWorkletNode(inputAudioContext, 'pcm-processor', {
+                        processorOptions: {
+                            sampleRate: inputAudioContext.sampleRate
+                        }
+                    });
+                    
+                    audioWorkletRef.current = workletNode;
+
+                    workletNode.port.onmessage = (e) => {
+                        const int16Data = e.data as Int16Array;
+                        const targetRate = 16000;
+                        
+                        const pcmBlob = {
+                            data: encode(new Uint8Array(int16Data.buffer)),
+                            mimeType: `audio/pcm;rate=${targetRate}`,
+                        };
+                        
+                        if (sessionPromiseRef.current) {
+                            sessionPromiseRef.current.then(session => {
+                                session.sendRealtimeInput({ audio: pcmBlob });
+                            }).catch(() => {});
+                        }
+                    };
+                    
+                    source.connect(inputAnalyserNode);
+                    inputAnalyserNode.connect(workletNode);
+                    
+                    const gainNode = inputAudioContext.createGain();
+                    gainNode.gain.setValueAtTime(0, inputAudioContext.currentTime);
+                    workletNode.connect(gainNode);
+                    gainNode.connect(inputAudioContext.destination);
+                } catch (audioPipeErr) {
+                    console.warn("Audio input pipeline warning (continuing in active session):", audioPipeErr);
+                }
+            }
+
+            // Everything is ready
+            setNexusStatus('LISTENING');
+            if ((sessionRef.current as any)?.isLocalSession) {
+                setLastError(null);
+                startOfflineRecognition();
+                if ((window as any).nexus?.speak) {
+                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy instalada y activa en tu sistema Linux. Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos cuando quieras.");
+                }
+            }
+
+        } catch (error: any) {
+            console.warn('Failed to connect:', error);
+            let errorMessage = 'No se pudo conectar.';
+            
+            if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                errorMessage = 'Necesitamos permiso para usar el micrófono.';
+            } else if (error.message?.includes('API_KEY') || /API key|not valid/i.test(error.message || '')) {
+                setLastError(null);
+                setNexusStatus('LISTENING');
+                startOfflineRecognition();
+                return;
+            } else if (error.message?.includes('The service is currently unavailable') || error.message?.includes('503')) {
+                errorMessage = 'El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.';
+            } else if (error.message?.includes('Network error') || error.message?.toLowerCase().includes('network')) {
+                errorMessage = 'Hubo un problema de red al intentar conectar con los servidores. Verifica tu conexión a internet.';
+            } else if (error.message) {
+                errorMessage = `Error al conectar: ${error.message}`;
+            }
+
+            setLastError(errorMessage);
+            setNexusStatus('OFFLINE');
+            handleDisconnect();
+        }
+    }, [handleDisconnect, handleMessage, startOfflineRecognition]);
+
+    useEffect(() => {
+        const handleOnline = () => {
+            if (nexusStatus === 'OFFLINE' && lastError?.includes('internet')) {
+                setLastError(null);
+                if (hasGrantedAccess) {
+                    if (recognitionRef.current) {
+                        try { recognitionRef.current.stop(); } catch(e) {}
+                    }
+                    connect().catch(err => console.error("Online reconnection error:", err));
+                }
+            }
+        };
+
+        const handleOffline = () => {
+            setLastError("Se ha perdido la conexión a internet. Cambiando a Modo Local con LM Studio/Ollama si están configurados.");
+            setNexusStatus('OFFLINE');
+            handleDisconnect();
+            
+            if ((window as any).nexus && (window as any).nexus.speak) {
+                (window as any).nexus.speak("Se ha perdido la conexión a internet. Cambio a modo local.");
+            }
+            
+            startOfflineRecognition();
+        };
+
+        const handleReconnect = () => {
+            if (hasGrantedAccess && navigator.onLine) {
+                setLastError("La sesión expiró por límite de tiempo. Reconectando...");
+                connect().catch(err => console.error("Reconnection error (event):", err));
+            }
+        };
+
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('nexus-reconnect', handleReconnect);
+
+        if (!navigator.onLine && hasGrantedAccess) {
+            startOfflineRecognition();
+        }
+
+        return () => {
+            window.removeEventListener('online', handleOnline);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('nexus-reconnect', handleReconnect);
+        };
+    }, [nexusStatus, lastError, hasGrantedAccess, connect, handleDisconnect, startOfflineRecognition]);
 
     useEffect(() => {
         return () => {
@@ -2321,7 +2296,35 @@ export const App: React.FC = () => {
             )}
             
             {/* Floating Navigation Controls */}
-            <div className="absolute bottom-6 left-6 z-50 flex flex-col gap-4">
+            <div className="absolute bottom-6 left-6 z-50 flex flex-col gap-3">
+                <button 
+                    onClick={() => setShowDebianPanel(true)}
+                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-emerald-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
+                    title="Instalador y Actualizador Debian / Kali Linux"
+                >
+                    <Package size={20} className="group-hover:scale-110 transition-transform" />
+                </button>
+                <button 
+                    onClick={() => setShowTerminal(true)}
+                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-amber-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
+                    title="Terminal del Sistema"
+                >
+                    <Terminal size={20} className="group-hover:scale-110 transition-transform" />
+                </button>
+                <button 
+                    onClick={() => setShowTelemetryPanel(true)}
+                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-cyan-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
+                    title="Telemetría en Tiempo Real"
+                >
+                    <Activity size={20} className="group-hover:scale-110 transition-transform" />
+                </button>
+                <button 
+                    onClick={() => setShowNotes(true)}
+                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-indigo-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
+                    title="Bloc de Notas"
+                >
+                    <FileText size={20} className="group-hover:scale-110 transition-transform" />
+                </button>
                 <button 
                     onClick={() => setShowMemoriesModal(true)}
                     className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-fuchsia-400 transition-all duration-300 shadow-lg backdrop-blur-md group"

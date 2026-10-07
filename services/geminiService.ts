@@ -618,10 +618,6 @@ export const NexusFunctionDeclarations = {
     addScreenShare: {
         name: 'addScreenShare',
         description: 'Abre el diálogo para que Koko comparta UNA PANTALLA ADICIONAL simultáneamente. Útil para entornos multi-monitor.',
-        parameters: {
-            type: Type.OBJECT,
-            properties: {}
-        }
     } as FunctionDeclaration,
     startVideoRecording: {
         name: 'startVideoRecording',
@@ -884,18 +880,34 @@ interface ConnectCallbacks {
 
 let cachedRuntimeApiKey: string = '';
 
-function isUsableApiKeyForCurrentHost(rawKey: string | undefined | null): boolean {
+function isAiStudioPreviewIframe(): boolean {
+    if (typeof window === 'undefined') return false;
+    try {
+        return (
+            window.self !== window.top &&
+            (window.location.hostname.endsWith('.run.app') || window.location.hostname.includes('aistudio'))
+        );
+    } catch {
+        return true;
+    }
+}
+
+function isStandaloneGeminiApiKey(rawKey: string | undefined | null): boolean {
     if (!rawKey) return false;
     const key = rawKey.trim().replace(/^["']|["']$/g, '');
-    if (!key || key === 'undefined' || key === 'null' || key === 'TU_CLAVE_GEMINI_AQUI' || key === 'TU_CLAVE_AQUI') {
-        return false;
-    }
-    const isAiStudioPreview = typeof window !== 'undefined' && (
-        window.location.hostname.endsWith('.run.app') ||
-        window.location.hostname.includes('aistudio')
-    );
-    // Internal AI Studio proxy tokens ("AQ....") only work inside the *.run.app proxy
-    if (!isAiStudioPreview && key.startsWith('AQ.')) {
+    if (
+        !key ||
+        key === 'undefined' ||
+        key === 'null' ||
+        key === 'MY_GEMINI_API_KEY' ||
+        key === 'GEMINI_API_KEY' ||
+        key === 'API_KEY' ||
+        key === 'YOUR_API_KEY' ||
+        key === 'YOUR_GEMINI_API_KEY' ||
+        key === 'TU_CLAVE_GEMINI_AQUI' ||
+        key === 'TU_CLAVE_AQUI' ||
+        key.startsWith('AQ.')
+    ) {
         return false;
     }
     return true;
@@ -906,7 +918,7 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
         const res = await fetch('/api/runtime-config', { cache: 'no-store' });
         if (res.ok) {
             const data = await res.json();
-            if (isUsableApiKeyForCurrentHost(data?.apiKey)) {
+            if (isStandaloneGeminiApiKey(data?.apiKey)) {
                 cachedRuntimeApiKey = data.apiKey.trim().replace(/^["']|["']$/g, '');
                 return cachedRuntimeApiKey;
             }
@@ -915,19 +927,28 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
         // Fallback if endpoint is unreachable
     }
 
-    if (!forceRefresh && isUsableApiKeyForCurrentHost(cachedRuntimeApiKey)) {
+    if (!forceRefresh && isStandaloneGeminiApiKey(cachedRuntimeApiKey)) {
         return cachedRuntimeApiKey;
     }
 
     const injectedKey = typeof window !== 'undefined' ? (window as any).__NEXUS_RUNTIME_CONFIG__?.apiKey : '';
-    if (isUsableApiKeyForCurrentHost(injectedKey)) {
+    if (isStandaloneGeminiApiKey(injectedKey)) {
         cachedRuntimeApiKey = injectedKey.trim().replace(/^["']|["']$/g, '');
         return cachedRuntimeApiKey;
     }
 
     const buildEnvKey = process.env.GEMINI_API_KEY;
-    if (isUsableApiKeyForCurrentHost(buildEnvKey)) {
+    if (isStandaloneGeminiApiKey(buildEnvKey)) {
         return buildEnvKey!.trim().replace(/^["']|["']$/g, '');
+    }
+
+    // Inside the AI Studio Preview iframe, _aistudio-iframe.js proxies WebSocket/fetch
+    // and substitutes the literal 'GEMINI_API_KEY' token from window.GEMINI_API_KEY.
+    if (isAiStudioPreviewIframe()) {
+        const iframeProxyToken =
+            (typeof window !== 'undefined' && ((window as any).GEMINI_API_KEY || (window as any).API_KEY)) ||
+            'GEMINI_API_KEY';
+        return String(iframeProxyToken);
     }
 
     return '';
@@ -950,9 +971,109 @@ function createLocalNexusSession(callbacks: ConnectCallbacks): LiveSession {
     };
 }
 
+async function connectSingleLiveModel(
+    ai: GoogleGenAI,
+    modelName: string,
+    systemInstruction: string,
+    userCallbacks: ConnectCallbacks
+): Promise<LiveSession> {
+    let setupVerified = false;
+    let setupReceived = false;
+    let settled = false;
+    let failed = false;
+
+    return new Promise<LiveSession>((resolve, reject) => {
+        let sessionInstance: LiveSession = null;
+
+        const tryFinishSuccess = () => {
+            if (settled || failed || !sessionInstance || !setupReceived) return;
+            settled = true;
+            setupVerified = true;
+            clearTimeout(connectTimeout);
+            try {
+                userCallbacks.onopen();
+            } catch {}
+            resolve(sessionInstance);
+        };
+
+        const finishFailure = (err: Error, shouldCloseSession = false) => {
+            if (settled) return;
+            settled = true;
+            failed = true;
+            clearTimeout(connectTimeout);
+            if (shouldCloseSession) {
+                try {
+                    if (sessionInstance && typeof sessionInstance.close === 'function') {
+                        sessionInstance.close();
+                    }
+                } catch {}
+            }
+            reject(err);
+        };
+
+        const connectTimeout = setTimeout(() => {
+            finishFailure(new Error(`Handshake timeout for model ${modelName}`), true);
+        }, 5000);
+
+        ai.live.connect({
+            model: modelName,
+            callbacks: {
+                onopen: () => {
+                    // Wait for setupComplete message from server before confirming session
+                },
+                onmessage: (message: LiveServerMessage) => {
+                    if (!setupVerified) {
+                        setupReceived = true;
+                        tryFinishSuccess();
+                    }
+                    userCallbacks.onmessage(message);
+                },
+                onerror: (e: ErrorEvent) => {
+                    if (!setupVerified) {
+                        finishFailure(new Error((e as any)?.message || `WebSocket error during setup of ${modelName}`), false);
+                        return;
+                    }
+                    userCallbacks.onerror(e);
+                },
+                onclose: (e: CloseEvent) => {
+                    if (!setupVerified) {
+                        finishFailure(new Error(`Setup closed (${e.code}): ${e.reason || 'rejected'}`), false);
+                        return;
+                    }
+                    userCallbacks.onclose(e);
+                },
+            },
+            config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: {
+                            voiceName: DEFAULT_NEXUS_VOICE,
+                        },
+                    },
+                },
+                systemInstruction: systemInstruction,
+                tools: [{ functionDeclarations: Object.values(NexusFunctionDeclarations) }],
+                inputAudioTranscription: {},
+                outputAudioTranscription: {},
+            },
+        })
+            .then((sess) => {
+                sessionInstance = sess;
+                if (failed) {
+                    return;
+                }
+                tryFinishSuccess();
+            })
+            .catch((err) => {
+                finishFailure(err instanceof Error ? err : new Error(String(err)), false);
+            });
+    });
+}
+
 // Global reference to ensure we don't recreate if not needed, or to handle specific instances.
 // However, creating a new instance per connection is safer for API key handling in some contexts.
-export async function connectToNexus(callbacks: ConnectCallbacks, retries = 3): Promise<LiveSession> {
+export async function connectToNexus(callbacks: ConnectCallbacks, _retries = 1): Promise<LiveSession> {
     const apiKey = await getEffectiveGeminiApiKey();
     if (!apiKey) {
         console.log('No cloud GEMINI_API_KEY configured for this host; starting Nexus in Local Linux Session mode.');
@@ -971,47 +1092,27 @@ Si hay mucho ruido de fondo, ruido de viento, coches, o gente hablando lejos, IG
 Si Koko te pregunta si recuerdas algo, BUSCA EN TU MEMORIA y respóndele con chulería.`;
     const systemInstruction = NEXUS_PERSONALITY_PROMPT() + memories + transcripts + finalDirective;
     
-    const modelsToTry = ['gemini-3.8-live', 'gemini-3.1-flash-live-preview'];
-    let lastError: any = null;
+    const modelsToTry = [
+        'gemini-2.5-flash-native-audio-preview-12-2025',
+        'gemini-2.5-flash-native-audio-preview-09-2025',
+        'gemini-3.8-live',
+    ];
 
     for (const modelName of modelsToTry) {
         try {
             console.log(`Connecting to Nexus Live API with model: ${modelName}`);
-            return await ai.live.connect({
-                model: modelName,
-                callbacks: callbacks,
-                config: {
-                    responseModalities: [Modality.AUDIO],
-                    speechConfig: {
-                        voiceConfig: { 
-                            prebuiltVoiceConfig: { 
-                                voiceName: DEFAULT_NEXUS_VOICE 
-                            } 
-                        },
-                    },
-                    systemInstruction: systemInstruction,
-                    tools: [{ functionDeclarations: Object.values(NexusFunctionDeclarations) }],
-                    inputAudioTranscription: {},
-                    outputAudioTranscription: {},
-                },
-            });
+            return await connectSingleLiveModel(ai, modelName, systemInstruction, callbacks);
         } catch (e: any) {
-            console.warn(`Model ${modelName} failed to connect:`, e);
-            lastError = e;
+            const msg = String(e?.message || '');
+            console.warn(`Model ${modelName} setup did not complete:`, msg);
+            if (/API_KEY|API key|not valid|UNAUTHENTICATED|PERMISSION_DENIED|invalid authentication|credential|401|403|1007/i.test(msg)) {
+                console.warn('Cloud API key rejected on this host; falling back immediately to Nexus Local Linux Session mode.');
+                return createLocalNexusSession(callbacks);
+            }
         }
     }
 
-    const errMsg = String(lastError?.message || '');
-    if (/API_KEY|UNAUTHENTICATED|PERMISSION_DENIED|invalid authentication|401|403/i.test(errMsg)) {
-        console.warn('Cloud API key rejected on this host; falling back to Nexus Local Linux Session mode.');
-        return createLocalNexusSession(callbacks);
-    }
-
-    if (retries > 0) {
-        console.warn(`All live models failed, retrying... (${retries} attempts left)`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        return connectToNexus(callbacks, retries - 1);
-    }
+    console.warn('All cloud live models unavailable; activating Nexus Local Linux Session mode.');
     return createLocalNexusSession(callbacks);
 }
 
