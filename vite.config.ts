@@ -13,10 +13,10 @@ export default defineConfig(({ mode }) => {
     rawKey === 'API_KEY' ||
     rawKey === 'YOUR_API_KEY' ||
     rawKey === 'TU_CLAVE_GEMINI_AQUI' ||
-    rawKey === 'TU_CLAVE_AQUI' ||
-    rawKey.startsWith('AQ.');
+    rawKey === 'TU_CLAVE_AQUI';
   return {
     define: {
+      'process.env.API_KEY': JSON.stringify(isPlaceholder ? '' : rawKey),
       'process.env.GEMINI_API_KEY': JSON.stringify(isPlaceholder ? '' : rawKey),
     },
     server: {

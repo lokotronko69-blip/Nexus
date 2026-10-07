@@ -835,17 +835,17 @@ export const NexusFunctionDeclarations = {
     } as FunctionDeclaration,
     systemAppControl: {
         name: 'systemAppControl',
-        description: 'Controla el ecosistema de aplicaciones e integración con el sistema operativo de Nexus. Permite abrir, cerrar y gestionar aplicaciones del sistema (telemetría de hardware, panel de instalación en Debian, terminal de comandos bash, bloc de notas, administrador de tareas/procesos, pizarra/canvas, cámara, compartición de pantalla) o lanzar aplicaciones y servicios externos del sistema operativo (ej: spotify, vscode, calc, mailto, etc.).',
+        description: 'Controla el ecosistema de aplicaciones y paneles en pantalla de Nexus. Úsalo SIEMPRE que Koko te pida abrir, mostrar, poner en pantalla, cerrar u ocultar cualquier panel o aplicación del sistema (telemetría de hardware, panel de instalación/actualización en Debian/Kali, terminal de comandos bash, bloc de notas, administrador de tareas/procesos, pizarra/canvas, memorias de Nexus, configuración local LM Studio/Ollama, cámara, compartición de pantalla) o lanzar aplicaciones externas del sistema operativo (ej: spotify, vscode, calc, mailto, etc.).',
         parameters: {
             type: Type.OBJECT,
             properties: {
                 action: {
                     type: Type.STRING,
-                    description: 'Acción: "open" (abrir aplicación), "close" (cerrar aplicación), "list" (listar aplicaciones disponibles y su estado), "focus" (traer al frente).',
+                    description: 'Acción: "open" (abrir/mostrar panel o aplicación en pantalla), "close" (cerrar/ocultar panel o aplicación), "list" (listar aplicaciones disponibles y su estado), "focus" (traer al frente).',
                 },
                 appId: {
                     type: Type.STRING,
-                    description: 'Identificador de la aplicación: "telemetry", "debian_install", "terminal", "notes", "process_manager", "canvas", "camera", "screen", "recorder", o aplicaciones externas de sistema como "spotify", "vscode", "calculator", "mail", "calendar".',
+                    description: 'Identificador del panel o aplicación: "telemetry", "debian_install", "terminal", "notes", "process_manager", "canvas", "memories", "config", "camera", "screen", "recorder", o aplicaciones externas de sistema como "spotify", "vscode", "calculator", "mail", "calendar".',
                 },
                 params: {
                     type: Type.STRING,
@@ -914,6 +914,7 @@ function isStandaloneGeminiApiKey(rawKey: string | undefined | null): boolean {
 }
 
 export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<string> {
+    let serverProxyKey = '';
     try {
         const res = await fetch('/api/runtime-config', { cache: 'no-store' });
         if (res.ok) {
@@ -921,6 +922,9 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
             if (isStandaloneGeminiApiKey(data?.apiKey)) {
                 cachedRuntimeApiKey = data.apiKey.trim().replace(/^["']|["']$/g, '');
                 return cachedRuntimeApiKey;
+            }
+            if (typeof data?.proxyKey === 'string' && data.proxyKey.trim()) {
+                serverProxyKey = data.proxyKey.trim();
             }
         }
     } catch {
@@ -930,6 +934,14 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
     if (!forceRefresh && isStandaloneGeminiApiKey(cachedRuntimeApiKey)) {
         return cachedRuntimeApiKey;
     }
+
+    try {
+        const localSavedKey = typeof window !== 'undefined' ? localStorage.getItem('nexus_gemini_api_key') : '';
+        if (isStandaloneGeminiApiKey(localSavedKey)) {
+            cachedRuntimeApiKey = localSavedKey!.trim().replace(/^["']|["']$/g, '');
+            return cachedRuntimeApiKey;
+        }
+    } catch {}
 
     const injectedKey = typeof window !== 'undefined' ? (window as any).__NEXUS_RUNTIME_CONFIG__?.apiKey : '';
     if (isStandaloneGeminiApiKey(injectedKey)) {
@@ -943,12 +955,14 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
     }
 
     // Inside the AI Studio Preview iframe, _aistudio-iframe.js proxies WebSocket/fetch
-    // and substitutes the literal 'GEMINI_API_KEY' token from window.GEMINI_API_KEY.
+    // by matching the exact proxy token injected into process.env.GEMINI_API_KEY (e.g. AQ.Ab8...).
     if (isAiStudioPreviewIframe()) {
         const iframeProxyToken =
+            buildEnvKey ||
+            serverProxyKey ||
             (typeof window !== 'undefined' && ((window as any).GEMINI_API_KEY || (window as any).API_KEY)) ||
             'GEMINI_API_KEY';
-        return String(iframeProxyToken);
+        return String(iframeProxyToken).trim();
     }
 
     return '';
@@ -984,12 +998,21 @@ async function connectSingleLiveModel(
 
     return new Promise<LiveSession>((resolve, reject) => {
         let sessionInstance: LiveSession = null;
+        let openStabilizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const clearTimers = () => {
+            clearTimeout(connectTimeout);
+            if (openStabilizeTimer) {
+                clearTimeout(openStabilizeTimer);
+                openStabilizeTimer = null;
+            }
+        };
 
         const tryFinishSuccess = () => {
             if (settled || failed || !sessionInstance || !setupReceived) return;
             settled = true;
             setupVerified = true;
-            clearTimeout(connectTimeout);
+            clearTimers();
             try {
                 userCallbacks.onopen();
             } catch {}
@@ -1000,7 +1023,7 @@ async function connectSingleLiveModel(
             if (settled) return;
             settled = true;
             failed = true;
-            clearTimeout(connectTimeout);
+            clearTimers();
             if (shouldCloseSession) {
                 try {
                     if (sessionInstance && typeof sessionInstance.close === 'function') {
@@ -1019,7 +1042,13 @@ async function connectSingleLiveModel(
             model: modelName,
             callbacks: {
                 onopen: () => {
-                    // Wait for setupComplete message from server before confirming session
+                    // If socket stays open for 650ms without error/close, mark setupReceived
+                    openStabilizeTimer = setTimeout(() => {
+                        if (!settled && !failed) {
+                            setupReceived = true;
+                            tryFinishSuccess();
+                        }
+                    }, 650);
                 },
                 onmessage: (message: LiveServerMessage) => {
                     if (!setupVerified) {

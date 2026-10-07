@@ -67,7 +67,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({ status, inputA
 
             ctx.clearRect(0, 0, width, height);
 
-            // 1. Always render subtle ambient background glow so the screen is never pitch black
             const isSpeaking = currentStatus === 'SPEAKING';
             const isThinking = currentStatus === 'THINKING';
             const isConnecting = currentStatus === 'CONNECTING';
@@ -75,63 +74,29 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({ status, inputA
                 ? '217, 70, 239'
                 : isThinking
                 ? '168, 85, 247'
-                : isConnecting
-                ? '56, 189, 248'
                 : '14, 165, 233';
 
-            const outerRadius = Math.max(Math.min(width, height) * 0.45, 50);
-            const bgGlow = ctx.createRadialGradient(
-                centerX,
-                centerY,
-                10,
-                centerX,
-                centerY,
-                outerRadius
-            );
-            bgGlow.addColorStop(0, `rgba(${primaryRgb}, 0.22)`);
-            bgGlow.addColorStop(0.5, `rgba(${primaryRgb}, 0.07)`);
-            bgGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
-            ctx.fillStyle = bgGlow;
-            ctx.fillRect(0, 0, width, height);
+            // Ambient particles when thinking or connecting
+            if (isThinking || isConnecting) {
+                particlesRef.current.forEach(p => {
+                    p.x += p.vx * (isThinking ? 2 : 1);
+                    p.y += p.vy * (isThinking ? 2 : 1);
 
-            // 2. Ambient floating particles in all active states
-            particlesRef.current.forEach(p => {
-                p.x += p.vx * (isThinking ? 2.2 : 0.8);
-                p.y += p.vy * (isThinking ? 2.2 : 0.8);
+                    if (p.x < 0) p.x = width;
+                    if (p.x > width) p.x = 0;
+                    if (p.y < 0) p.y = height;
+                    if (p.y > height) p.y = 0;
 
-                if (p.x < 0) p.x = width;
-                if (p.x > width) p.x = 0;
-                if (p.y < 0) p.y = height;
-                if (p.y > height) p.y = 0;
+                    ctx.globalAlpha = p.opacity;
+                    ctx.fillStyle = `rgb(${primaryRgb})`;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+                ctx.globalAlpha = 1.0;
+            }
 
-                ctx.globalAlpha = isThinking ? p.opacity : p.opacity * 0.55;
-                ctx.fillStyle = `rgb(${primaryRgb})`;
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, isThinking ? p.r * 1.3 : p.r, 0, Math.PI * 2);
-                ctx.fill();
-            });
-            ctx.globalAlpha = 1.0;
-
-            // 3. Central Nexus Core Orb (always visible & breathing)
-            const pulseRadius = 46 + Math.sin(phase * 1.4) * 8 + (isSpeaking ? 12 : 0);
-            ctx.save();
-            ctx.beginPath();
-            ctx.arc(centerX, centerY, pulseRadius * 1.45, 0, Math.PI * 2);
-            ctx.strokeStyle = `rgba(${primaryRgb}, ${0.25 + Math.sin(phase) * 0.1})`;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-
-            ctx.beginPath();
-            ctx.arc(centerX, centerY, pulseRadius, 0, Math.PI * 2);
-            const coreGrad = ctx.createRadialGradient(centerX, centerY, 4, centerX, centerY, pulseRadius);
-            coreGrad.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
-            coreGrad.addColorStop(0.35, `rgba(${primaryRgb}, 0.65)`);
-            coreGrad.addColorStop(1, `rgba(${primaryRgb}, 0.05)`);
-            ctx.fillStyle = coreGrad;
-            ctx.fill();
-            ctx.restore();
-
-            // 4. Audio-reactive or Synthetic Ambient Waveform
+            // Audio-reactive or subtle breathing waveform
             const analyser = currentStatus === 'SPEAKING' && outputAnalyser ? outputAnalyser : inputAnalyser;
             const bufferLength = analyser ? analyser.frequencyBinCount : 128;
 

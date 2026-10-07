@@ -35,9 +35,6 @@ export const App: React.FC = () => {
     const [terminalInitialCmd, setTerminalInitialCmd] = useState<string | undefined>(undefined);
     const [notesInitialContent, setNotesInitialContent] = useState<string | undefined>(undefined);
     const [memories, setMemories] = useState<any[]>([]);
-    const [hudCommandInput, setHudCommandInput] = useState('');
-    const [lastSpokenMessage, setLastSpokenMessage] = useState<string | null>(null);
-    const [isLocalModeActive, setIsLocalModeActive] = useState(false);
 
     const isCameraActiveRef = useRef(false);
     const isScreenSharingRef = useRef(false);
@@ -77,6 +74,117 @@ export const App: React.FC = () => {
     
     // Offline recognition
     const recognitionRef = useRef<any>(null);
+    const inputTranscriptBufferRef = useRef<string>('');
+    const inputTranscriptTimerRef = useRef<number | null>(null);
+    const autoStartedRef = useRef<boolean>(false);
+    const [typedCommandBuffer, setTypedCommandBuffer] = useState<string>('');
+
+    const matchAndApplyPanelCommand = useCallback((rawInput: string): string | null => {
+        const lower = (rawInput || '').toLowerCase().trim();
+        if (!lower) return null;
+
+        const isClose = /(cierra|cerrar|quita|quitar|oculta|ocultar|esconde|desactiva)/i.test(lower);
+
+        if (isClose && /(todo|todos|paneles|pantalla|interfaz)/i.test(lower)) {
+            setShowTelemetryPanel(false);
+            setShowDebianPanel(false);
+            setShowTerminal(false);
+            setShowNotes(false);
+            setShowProcessManager(false);
+            setShowCanvas(false);
+            setShowMemoriesModal(false);
+            setShowConfigModal(false);
+            return "Todos los paneles cerrados, Koko. Pantalla limpia.";
+        }
+
+        if (/(debian|kali|instalador|instalaci[oó]n|instalar|actualizador|actualizar|paquete|\.deb)/i.test(lower)) {
+            if (isClose) {
+                setShowDebianPanel(false);
+                return "Panel de instalación y actualización de Debian y Kali cerrado.";
+            }
+            if (/(abre|abrir|muestra|mostrar|ens[eé][ñn]ame|ver|pon|poner|panel|comandos|instalar|instalador|actualizador|actualizar|debian|kali)/i.test(lower)) {
+                setShowDebianPanel(true);
+                return "Aquí tienes en pantalla el instalador y actualizador atómico para Debian y Kali Linux, Koko.";
+            }
+        }
+
+        if (/(telemetr[ií]a|consumo|rendimiento|m[eé]trica|gr[aá]fic)/i.test(lower) || (/(abre|abrir|muestra|ver|pon|panel|cierra|quita|oculta).*(cpu|memoria|ram|latencia)/i.test(lower))) {
+            if (isClose) {
+                setShowTelemetryPanel(false);
+                return "Panel de telemetría cerrado.";
+            }
+            setShowTelemetryPanel(true);
+            return "Te pongo en pantalla el panel de telemetría en tiempo real, Koko.";
+        }
+
+        if (/(terminal|consola|shell|bash)/i.test(lower)) {
+            if (isClose) {
+                setShowTerminal(false);
+                return "Terminal del sistema cerrada.";
+            }
+            if (/(abre|abrir|lanzar|muestra|mostrar|pon|poner|panel|activa)/i.test(lower) || /^(terminal|consola|shell|bash)$/i.test(lower)) {
+                setShowTerminal(true);
+                return "Abriendo la terminal de comandos del sistema en pantalla, Koko.";
+            }
+        }
+
+        if (/(notas|bloc de notas|notepad|apuntes)/i.test(lower)) {
+            if (isClose) {
+                setShowNotes(false);
+                return "Bloc de notas cerrado.";
+            }
+            if (/(abre|abrir|lanzar|muestra|mostrar|pon|poner|panel|activa)/i.test(lower) || /^(notas|bloc de notas|notepad|apuntes)$/i.test(lower)) {
+                setShowNotes(true);
+                return "Abriendo tu bloc de notas en pantalla, Koko.";
+            }
+        }
+
+        if (/(procesos|administrador de tareas|gestor de tareas)/i.test(lower)) {
+            if (isClose) {
+                setShowProcessManager(false);
+                return "Administrador de procesos cerrado.";
+            }
+            if (/(abre|abrir|lanzar|muestra|mostrar|pon|poner|panel|activa)/i.test(lower) || /^(procesos|administrador de tareas|gestor de tareas|tareas)$/i.test(lower)) {
+                setShowProcessManager(true);
+                return "Abriendo el gestor de procesos del sistema en pantalla.";
+            }
+        }
+
+        if (/(pizarra|canvas|lienzo|dibujo)/i.test(lower)) {
+            if (isClose) {
+                setShowCanvas(false);
+                return "Pizarra cerrada.";
+            }
+            if (/(abre|abrir|lanzar|muestra|mostrar|pon|poner|panel|activa)/i.test(lower) || /^(pizarra|canvas|lienzo)$/i.test(lower)) {
+                setShowCanvas(true);
+                return "Pizarra interactiva en pantalla, Koko.";
+            }
+        }
+
+        if (/(memorias|recuerdos)/i.test(lower)) {
+            if (isClose) {
+                setShowMemoriesModal(false);
+                return "Panel de memorias cerrado.";
+            }
+            if (/(abre|abrir|muestra|mostrar|ens[eé][ñn]ame|ver|pon|poner|panel)/i.test(lower) || /^(memorias|recuerdos)$/i.test(lower)) {
+                setShowMemoriesModal(true);
+                return "Aquí tienes mis memorias en pantalla, Koko.";
+            }
+        }
+
+        if (/(configuraci[oó]n|ajustes|ollama|lm studio)/i.test(lower)) {
+            if (isClose) {
+                setShowConfigModal(false);
+                return "Panel de configuración cerrado.";
+            }
+            if (/(abre|abrir|muestra|mostrar|pon|poner|panel)/i.test(lower) || /^(configuraci[oó]n|ajustes)$/i.test(lower)) {
+                setShowConfigModal(true);
+                return "Abriendo el panel de configuración local en pantalla.";
+            }
+        }
+
+        return null;
+    }, []);
 
     // Move playback state to refs to survive re-renders and handle cleanup correctly
     const nextStartTimeRef = useRef<number>(0);
@@ -325,6 +433,12 @@ export const App: React.FC = () => {
                 } else if (id === 'canvas' || id === 'pizarra' || id === 'dibujo') {
                     setShowCanvas(true);
                     return "Pizarra gráfica interactiva abierta.";
+                } else if (id === 'memories' || id === 'memorias' || id === 'recuerdos' || id === 'memoria') {
+                    setShowMemoriesModal(true);
+                    return "Panel de memorias de Nexus abierto.";
+                } else if (id === 'config' || id === 'configuracion' || id === 'configuración' || id === 'ajustes') {
+                    setShowConfigModal(true);
+                    return "Panel de configuración local abierto.";
                 } else if (id === 'camera' || id === 'camara' || id === 'ojos') {
                     startCamera('environment');
                     return "Sensor óptico / cámara activado.";
@@ -375,6 +489,12 @@ export const App: React.FC = () => {
                 } else if (id === 'canvas' || id === 'pizarra' || id === 'dibujo') {
                     setShowCanvas(false);
                     return "Pizarra gráfica cerrada.";
+                } else if (id === 'memories' || id === 'memorias' || id === 'recuerdos' || id === 'memoria') {
+                    setShowMemoriesModal(false);
+                    return "Panel de memorias cerrado.";
+                } else if (id === 'config' || id === 'configuracion' || id === 'configuración' || id === 'ajustes') {
+                    setShowConfigModal(false);
+                    return "Panel de configuración cerrado.";
                 } else if (id === 'camera' || id === 'camara') {
                     stopCamera();
                     return "Cámara desactivada.";
@@ -434,13 +554,50 @@ export const App: React.FC = () => {
                 }
             },
             speak: (text: string, lang = 'es-ES') => {
-                setLastSpokenMessage(text);
+                setNexusStatus('SPEAKING');
+                const fallbackDuration = Math.min(Math.max(text.length * 55, 2200), 8500);
+                const fallbackTimer = window.setTimeout(() => {
+                    setNexusStatus(prev => (prev === 'SPEAKING' ? 'LISTENING' : prev));
+                }, fallbackDuration);
+
+                const playLinuxWavFallback = async () => {
+                    try {
+                        const res = await fetch('/api/local-tts', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ text })
+                        });
+                        if (!res.ok) return false;
+                        const wavBuf = await res.arrayBuffer();
+                        const ctx = outputAudioContextRef.current;
+                        const analyser = outputAnalyserRef.current;
+                        if (ctx && analyser) {
+                            if (ctx.state === 'suspended') await ctx.resume();
+                            const decoded = await ctx.decodeAudioData(wavBuf.slice(0));
+                            const src = ctx.createBufferSource();
+                            src.buffer = decoded;
+                            src.connect(analyser);
+                            src.onended = () => {
+                                clearTimeout(fallbackTimer);
+                                setNexusStatus('LISTENING');
+                            };
+                            src.start(0);
+                            return true;
+                        }
+                    } catch {}
+                    return false;
+                };
+
                 if ('speechSynthesis' in window) {
                     try {
-                        window.speechSynthesis.cancel(); // Stop talking first
+                        window.speechSynthesis.cancel();
+                        const voices = window.speechSynthesis.getVoices();
+                        if (!voices || voices.length === 0) {
+                            playLinuxWavFallback();
+                            return "Hablando usando sintetizador Linux.";
+                        }
                         const utterance = new SpeechSynthesisUtterance(text);
                         utterance.lang = lang;
-                        const voices = window.speechSynthesis.getVoices();
                         const defaultSpanishVoice =
                             voices.find(v => v.lang === 'es-ES' && v.default) ||
                             voices.find(v => v.lang === 'es-ES') ||
@@ -450,11 +607,6 @@ export const App: React.FC = () => {
                         }
                         utterance.rate = 1.0;
                         utterance.pitch = 1.0;
-                        setNexusStatus('SPEAKING');
-                        const fallbackDuration = Math.min(Math.max(text.length * 55, 2200), 8500);
-                        const fallbackTimer = window.setTimeout(() => {
-                            setNexusStatus(prev => (prev === 'SPEAKING' ? 'LISTENING' : prev));
-                        }, fallbackDuration);
                         utterance.onstart = () => {
                             setNexusStatus('SPEAKING');
                         };
@@ -463,16 +615,17 @@ export const App: React.FC = () => {
                             setNexusStatus('LISTENING');
                         };
                         utterance.onerror = () => {
-                            clearTimeout(fallbackTimer);
-                            setNexusStatus('LISTENING');
+                            playLinuxWavFallback();
                         };
                         window.speechSynthesis.speak(utterance);
                         return "Hablando usando hardware local.";
                     } catch {
-                        setNexusStatus('LISTENING');
+                        playLinuxWavFallback();
                     }
+                } else {
+                    playLinuxWavFallback();
                 }
-                return "speechSynthesis no soportado.";
+                return "Hablando.";
             },
             stopSpeaking: () => {
                 if ('speechSynthesis' in window) {
@@ -890,11 +1043,21 @@ export const App: React.FC = () => {
             const inputTranscriptionText = (message.serverContent as any).inputAudioTranscription?.text || (message.serverContent as any).inputTranscription?.text;
             if (inputTranscriptionText) {
                 saveTranscript(inputTranscriptionText, 'user');
+                inputTranscriptBufferRef.current = `${inputTranscriptBufferRef.current} ${inputTranscriptionText}`.trim().slice(-200);
+                if (inputTranscriptTimerRef.current) {
+                    window.clearTimeout(inputTranscriptTimerRef.current);
+                }
+                inputTranscriptTimerRef.current = window.setTimeout(() => {
+                    inputTranscriptBufferRef.current = '';
+                }, 6000);
+
+                if (matchAndApplyPanelCommand(inputTranscriptBufferRef.current) || matchAndApplyPanelCommand(inputTranscriptionText)) {
+                    inputTranscriptBufferRef.current = '';
+                }
             }
 
             if(outputTranscription?.text) {
                 setNexusStatus('SPEAKING');
-                setLastSpokenMessage(outputTranscription.text);
                 saveTranscript(outputTranscription.text, 'model');
             }
 
@@ -1557,88 +1720,11 @@ export const App: React.FC = () => {
         console.log("Nexus command:", transcript);
         saveTranscript(transcript, 'user');
 
-        const lowerTranscript = transcript.toLowerCase();
-        if (/(muestra|abrir|abre|enséñame|ver|pon|activar?).*(consumo|cpu|memoria|latencia|rendimiento|telemetr)/i.test(lowerTranscript)) {
-            setShowTelemetryPanel(true);
+        const panelFeedback = matchAndApplyPanelCommand(transcript);
+        if (panelFeedback) {
+            saveTranscript(panelFeedback, 'model');
             if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Te abro el panel de telemetría en tiempo real con gráficos de Recharts, Koko.");
-            }
-            return;
-        }
-        if (/(cierra|quita|oculta|desactivar?).*(panel|consumo|telemetr|gráfic|grafic|métrica|metrica)/i.test(lowerTranscript) && !/debian/i.test(lowerTranscript)) {
-            setShowTelemetryPanel(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Panel de telemetría cerrado. De vuelta a la interfaz habitual.");
-            }
-            return;
-        }
-        if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete|actualizar|actualizador).*(debian|kali|linux)/i.test(lowerTranscript)) {
-            setShowDebianPanel(true);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Aquí tienes el panel con el instalador y actualizador atómico para Debian y Kali Linux, Koko.");
-            }
-            return;
-        }
-        if (/(cierra|cerrar|quita|quitar|oculta).*(debian|kali|instalador|comandos de instalación|comandos de instalacion)/i.test(lowerTranscript)) {
-            setShowDebianPanel(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Panel de instalación de Debian y Kali cerrado.");
-            }
-            return;
-        }
-        if (/(abre|abrir|lanzar|muestra).*(terminal|consola|shell)/i.test(lowerTranscript)) {
-            setShowTerminal(true);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Abriendo la terminal de comandos del sistema, Koko.");
-            }
-            return;
-        }
-        if (/(cierra|cerrar|quitar|oculta).*(terminal|consola|shell)/i.test(lowerTranscript)) {
-            setShowTerminal(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Terminal del sistema cerrada.");
-            }
-            return;
-        }
-        if (/(abre|abrir|lanzar|muestra).*(notas|bloc de notas|notepad|apuntes)/i.test(lowerTranscript)) {
-            setShowNotes(true);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Abriendo tu bloc de notas del sistema, Koko.");
-            }
-            return;
-        }
-        if (/(cierra|cerrar|quitar|oculta).*(notas|bloc de notas|notepad)/i.test(lowerTranscript)) {
-            setShowNotes(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Bloc de notas cerrado.");
-            }
-            return;
-        }
-        if (/(abre|abrir|lanzar|muestra).*(procesos|administrador de tareas|gestor de tareas)/i.test(lowerTranscript)) {
-            setShowProcessManager(true);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Abriendo el administrador de procesos del sistema.");
-            }
-            return;
-        }
-        if (/(cierra|cerrar|quitar|oculta).*(procesos|administrador de tareas)/i.test(lowerTranscript)) {
-            setShowProcessManager(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Administrador de procesos cerrado.");
-            }
-            return;
-        }
-        if (/(abre|abrir|lanzar|muestra).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
-            setShowCanvas(true);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Pizarra interactiva abierta.");
-            }
-            return;
-        }
-        if (/(cierra|cerrar|quitar|oculta).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
-            setShowCanvas(false);
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Pizarra cerrada.");
+                (window as any).nexus.speak(panelFeedback);
             }
             return;
         }
@@ -1931,7 +2017,6 @@ export const App: React.FC = () => {
                 
                 if (errorMessage.includes("API_KEY") || /API key|not valid|UNAUTHENTICATED|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
                     setLastError(null);
-                    setIsLocalModeActive(true);
                     setNexusStatus('LISTENING');
                     startOfflineRecognition();
                     return;
@@ -2036,15 +2121,11 @@ export const App: React.FC = () => {
             // Everything is ready
             setNexusStatus('LISTENING');
             if ((sessionRef.current as any)?.isLocalSession) {
-                setIsLocalModeActive(true);
                 setLastError(null);
                 startOfflineRecognition();
                 if ((window as any).nexus?.speak) {
-                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy activa en tu sistema. Pídeme por voz o escribe abajo para abrir la terminal, la telemetría, el instalador de Debian/Kali, las notas o el gestor de procesos.");
+                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy activa en tu sistema. Dime qué necesitas.");
                 }
-            } else {
-                setIsLocalModeActive(false);
-                setLastSpokenMessage("Conexión en vivo establecida con Nexus. Háblame o escribe un comando.");
             }
 
         } catch (error: any) {
@@ -2118,6 +2199,63 @@ export const App: React.FC = () => {
             window.removeEventListener('nexus-reconnect', handleReconnect);
         };
     }, [nexusStatus, lastError, hasGrantedAccess, connect, handleDisconnect, startOfflineRecognition]);
+
+    // Auto-start Nexus immediately when installed on computer (localhost / 127.0.0.1 / standalone PWA window)
+    useEffect(() => {
+        if (autoStartedRef.current) return;
+        const isInstalledOrLocalhost =
+            typeof window !== 'undefined' &&
+            (window.location.hostname === 'localhost' ||
+                window.location.hostname === '127.0.0.1' ||
+                window.matchMedia('(display-mode: standalone)').matches);
+
+        if (isInstalledOrLocalhost) {
+            autoStartedRef.current = true;
+            setHasGrantedAccess(true);
+            connect().catch(err => {
+                console.warn("Auto-start connect warning:", err);
+                setNexusStatus('LISTENING');
+                startOfflineRecognition();
+            });
+        }
+    }, [connect, startOfflineRecognition]);
+
+    // Invisible keyboard listener on the clean Nexus wave screen so Koko can also type commands without any static UI bar
+    useEffect(() => {
+        if (!hasGrantedAccess) return;
+        const handleKeyDown = (e: KeyboardEvent) => {
+            const activeEl = document.activeElement;
+            const tag = activeEl?.tagName?.toLowerCase();
+            if (tag === 'input' || tag === 'textarea' || (activeEl as HTMLElement)?.isContentEditable) {
+                return;
+            }
+            if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+            if (e.key === 'Escape') {
+                setTypedCommandBuffer('');
+                return;
+            }
+            if (e.key === 'Backspace') {
+                setTypedCommandBuffer(prev => prev.slice(0, -1));
+                return;
+            }
+            if (e.key === 'Enter') {
+                setTypedCommandBuffer(prev => {
+                    const cmd = prev.trim();
+                    if (cmd) {
+                        processLocalCommand(cmd);
+                    }
+                    return '';
+                });
+                return;
+            }
+            if (e.key.length === 1) {
+                setTypedCommandBuffer(prev => (prev + e.key).slice(0, 160));
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [hasGrantedAccess, processLocalCommand]);
 
     useEffect(() => {
         return () => {
@@ -2209,108 +2347,11 @@ export const App: React.FC = () => {
             
             <VoiceVisualizer status={nexusStatus} inputAnalyser={inputAnalyser} outputAnalyser={outputAnalyser} />
 
-            {/* Top Nexus HUD Status Header */}
-            <div className="absolute top-5 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none select-none">
-                <div className="flex items-center gap-3 px-4 py-2 rounded-full bg-zinc-950/80 border border-zinc-800/90 backdrop-blur-md shadow-[0_0_30px_rgba(14,165,233,0.15)]">
-                    <span
-                        className={`w-2.5 h-2.5 rounded-full ${
-                            nexusStatus === 'SPEAKING'
-                                ? 'bg-fuchsia-400 animate-ping'
-                                : nexusStatus === 'THINKING'
-                                ? 'bg-purple-400 animate-pulse'
-                                : nexusStatus === 'CONNECTING'
-                                ? 'bg-sky-400 animate-ping'
-                                : 'bg-emerald-400 animate-pulse'
-                        }`}
-                    />
-                    <span className="text-xs font-mono uppercase tracking-widest text-zinc-200 font-semibold">
-                        {nexusStatus === 'CONNECTING'
-                            ? 'NEXUS · INICIANDO NÚCLEO...'
-                            : nexusStatus === 'SPEAKING'
-                            ? 'NEXUS · HABLANDO'
-                            : nexusStatus === 'THINKING'
-                            ? 'NEXUS · PROCESANDO'
-                            : isLocalModeActive
-                            ? 'NEXUS OS · MODO LOCAL ACTIVO'
-                            : 'NEXUS LIVE · ESCUCHANDO'}
-                    </span>
+            {typedCommandBuffer && (
+                <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 px-5 py-2.5 rounded-full bg-zinc-950/90 border border-zinc-800 text-zinc-100 text-sm font-mono shadow-2xl backdrop-blur-md pointer-events-none">
+                    {typedCommandBuffer}
                 </div>
-            </div>
-
-            {/* Bottom Interactive Nexus Command Bar & Subtitle HUD */}
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-4 flex flex-col items-center gap-3 pointer-events-auto">
-                {lastSpokenMessage && (
-                    <div className="w-full px-4 py-2.5 rounded-2xl bg-zinc-950/85 border border-fuchsia-500/30 backdrop-blur-md text-center shadow-lg">
-                        <p className="text-xs md:text-sm text-zinc-200 leading-relaxed">
-                            <span className="text-fuchsia-400 font-bold mr-1.5">NEXUS:</span>
-                            {lastSpokenMessage}
-                        </p>
-                    </div>
-                )}
-
-                <form
-                    onSubmit={(e) => {
-                        e.preventDefault();
-                        const cmd = hudCommandInput.trim();
-                        if (!cmd) return;
-                        setHudCommandInput('');
-                        processLocalCommand(cmd);
-                    }}
-                    className="w-full flex items-center gap-2 bg-zinc-950/85 border border-zinc-800 hover:border-zinc-700 focus-within:border-sky-500/60 rounded-full px-4 py-2 backdrop-blur-md shadow-[0_0_35px_rgba(0,0,0,0.7)] transition-colors"
-                >
-                    <input
-                        type="text"
-                        value={hudCommandInput}
-                        onChange={(e) => setHudCommandInput(e.target.value)}
-                        placeholder="Háblale a Nexus o escribe un comando (ej: abre terminal, telemetría, debian, estado)..."
-                        className="flex-1 bg-transparent text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none px-2"
-                    />
-                    <button
-                        type="submit"
-                        className="px-4 py-1.5 rounded-full bg-gradient-to-r from-sky-500 to-fuchsia-500 text-white text-xs font-bold uppercase tracking-wider hover:opacity-90 active:scale-95 transition-all"
-                    >
-                        Enviar
-                    </button>
-                </form>
-
-                <div className="flex flex-wrap items-center justify-center gap-2">
-                    <button
-                        type="button"
-                        onClick={() => setShowDebianPanel(true)}
-                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-emerald-500/30 text-emerald-300 text-xs font-mono transition-colors"
-                    >
-                        Debian / Kali
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setShowTelemetryPanel(true)}
-                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-cyan-500/30 text-cyan-300 text-xs font-mono transition-colors"
-                    >
-                        Telemetría
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setShowTerminal(true)}
-                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-amber-500/30 text-amber-300 text-xs font-mono transition-colors"
-                    >
-                        Terminal
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setShowProcessManager(true)}
-                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-purple-500/30 text-purple-300 text-xs font-mono transition-colors"
-                    >
-                        Procesos
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setShowNotes(true)}
-                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-indigo-500/30 text-indigo-300 text-xs font-mono transition-colors"
-                    >
-                        Notas
-                    </button>
-                </div>
-            </div>
+            )}
             
             {showCanvas && (
                 <div className="absolute inset-0 z-20 flex items-center justify-center p-8 bg-black/40 backdrop-blur-sm animate-fade-in">
@@ -2456,52 +2497,6 @@ export const App: React.FC = () => {
                 </div>
             )}
             
-            {/* Floating Navigation Controls */}
-            <div className="absolute bottom-6 left-6 z-50 flex flex-col gap-3">
-                <button 
-                    onClick={() => setShowDebianPanel(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-emerald-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Instalador y Actualizador Debian / Kali Linux"
-                >
-                    <Package size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-                <button 
-                    onClick={() => setShowTerminal(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-amber-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Terminal del Sistema"
-                >
-                    <Terminal size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-                <button 
-                    onClick={() => setShowTelemetryPanel(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-cyan-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Telemetría en Tiempo Real"
-                >
-                    <Activity size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-                <button 
-                    onClick={() => setShowNotes(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-indigo-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Bloc de Notas"
-                >
-                    <FileText size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-                <button 
-                    onClick={() => setShowMemoriesModal(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-fuchsia-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Ver memorias"
-                >
-                    <Brain size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-                <button 
-                    onClick={() => setShowConfigModal(true)}
-                    className="p-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/50 rounded-full text-zinc-400 hover:text-sky-400 transition-all duration-300 shadow-lg backdrop-blur-md group"
-                    title="Configuración local"
-                >
-                    <Cpu size={20} className="group-hover:scale-110 transition-transform" />
-                </button>
-            </div>
-
             {/* Config Modal */}
             {showConfigModal && (
                 <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in p-4 overflow-y-auto">

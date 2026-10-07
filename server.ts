@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import { Server } from 'socket.io';
 import http from 'http';
 import os from 'os';
@@ -9,7 +8,7 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.2.0';
+const NEXUS_VERSION = '1.2.1';
 
 interface NexusVaultData {
   version: string;
@@ -137,34 +136,131 @@ INSTALL_DIR="/opt/nexus"
 ENV_FILE="/opt/nexus/.env"
 DATA_DIR="/opt/nexus/data"
 BACKUP_DIR="/var/backups/nexus"
-REAL_USER="\${SUDO_USER:-\$(grep -E '^User=' /etc/systemd/system/nexus.service 2>/dev/null | cut -d= -f2 || whoami)}"
-USER_HOME="\$(getent passwd "\$REAL_USER" 2>/dev/null | cut -d: -f6 || echo "/home/\$REAL_USER")"
-PORT=\$(grep -E '^PORT=' "\$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "3000")
+NODE_BIN="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
+
+# Detectar usuario real de escritorio en Debian / Kali Linux
+DETECTED_USER="\${SUDO_USER:-}"
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  SVC_USER="\$(grep -E '^User=' /etc/systemd/system/nexus.service 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '[:space:]')"
+  if [ -n "\$SVC_USER" ] && id "\$SVC_USER" >/dev/null 2>&1 && [ "\$SVC_USER" != "root" ]; then
+    DETECTED_USER="\$SVC_USER"
+  fi
+fi
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(logname 2>/dev/null || true)"
+fi
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1; exit}' /etc/passwd 2>/dev/null || whoami)"
+fi
+REAL_USER="\${DETECTED_USER:-root}"
+USER_HOME="\$(getent passwd "\$REAL_USER" 2>/dev/null | cut -d: -f6)"
+if [ -z "\$USER_HOME" ]; then
+  if [ "\$REAL_USER" = "root" ]; then USER_HOME="/root"; else USER_HOME="/home/\$REAL_USER"; fi
+fi
+
+PORT="\$(grep -E '^PORT=' "\$ENV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"\\047[:space:]')"
+PORT="\${PORT:-3000}"
+LOG_FILE="/tmp/nexus-runtime-\$(id -u).log"
+
+ensure_nexus_running() {
+  if curl -fsS "http://127.0.0.1:\$PORT/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[*] Iniciando núcleo de Nexus en el puerto \$PORT..."
+  if command -v systemctl >/dev/null 2>&1; then
+    if [ "\$(id -u)" -eq 0 ]; then
+      systemctl start "\$SERVICE" 2>/dev/null || true
+    else
+      systemctl start "\$SERVICE" 2>/dev/null || sudo -n systemctl start "\$SERVICE" 2>/dev/null || true
+    fi
+    for _ in 1 2 3; do
+      if curl -fsS "http://127.0.0.1:\$PORT/api/health" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+    done
+  fi
+
+  # Fallback directo: arranca el servidor precompilado auto-contenido sin requerir systemd ni sudo
+  if [ -f "\$INSTALL_DIR/dist/server.cjs" ]; then
+    echo "[*] Arrancando demonio directo de Nexus (\$NODE_BIN \$INSTALL_DIR/dist/server.cjs)..."
+    (
+      cd "\$INSTALL_DIR" || exit 1
+      export PORT="\$PORT"
+      export NODE_ENV="production"
+      if [ -r "\$ENV_FILE" ]; then
+        set -a
+        . "\$ENV_FILE" 2>/dev/null || true
+        set +a
+      fi
+      nohup "\$NODE_BIN" "\$INSTALL_DIR/dist/server.cjs" >> "\$LOG_FILE" 2>&1 &
+    )
+    for _ in 1 2 3 4 5 6; do
+      if curl -fsS "http://127.0.0.1:\$PORT/api/health" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+    done
+  fi
+
+  echo "[!] Aviso: Nexus aún no responde en http://127.0.0.1:\$PORT. Revisa: cat \$LOG_FILE o nexus logs"
+  return 1
+}
 
 case "\$1" in
   start)
-    sudo systemctl start "\$SERVICE"
-    echo "Nexus iniciado en http://localhost:\$PORT"
+    ensure_nexus_running
+    echo "[✓] Nexus activo en http://localhost:\$PORT"
     ;;
   stop)
-    sudo systemctl stop "\$SERVICE"
+    sudo systemctl stop "\$SERVICE" 2>/dev/null || systemctl stop "\$SERVICE" 2>/dev/null || true
+    pkill -f "/opt/nexus/dist/server.cjs" 2>/dev/null || true
     echo "Nexus detenido."
     ;;
   restart)
-    sudo systemctl restart "\$SERVICE"
-    echo "Nexus reiniciado."
+    sudo systemctl stop "\$SERVICE" 2>/dev/null || systemctl stop "\$SERVICE" 2>/dev/null || true
+    pkill -f "/opt/nexus/dist/server.cjs" 2>/dev/null || true
+    sleep 1
+    ensure_nexus_running
+    echo "[✓] Nexus reiniciado en http://localhost:\$PORT"
     ;;
   status)
-    systemctl status "\$SERVICE" --no-pager
+    if curl -fsS "http://127.0.0.1:\$PORT/api/health" >/dev/null 2>&1; then
+      echo "[✓] Nexus está ACTIVO y respondiendo en http://localhost:\$PORT"
+      curl -s "http://127.0.0.1:\$PORT/api/health" && echo ""
+    else
+      echo "[!] Nexus NO responde en el puerto \$PORT."
+    fi
+    systemctl status "\$SERVICE" --no-pager 2>/dev/null || true
     ;;
   logs)
-    journalctl -u "\$SERVICE" -f
+    for lf in /tmp/nexus-runtime*.log; do
+      if [ -f "\$lf" ]; then
+        echo "--- \$lf ---"
+        tail -n 40 "\$lf"
+      fi
+    done
+    journalctl -u "\$SERVICE" -n 50 -f
+    ;;
+  doctor|fix)
+    echo "[*] Ejecutando auto-reparación de Nexus en \$INSTALL_DIR..."
+    sudo chown -R "\$REAL_USER:\$REAL_USER" "\$INSTALL_DIR" 2>/dev/null || true
+    sudo chmod 644 "\$ENV_FILE" 2>/dev/null || true
+    if [ -f /etc/systemd/system/nexus.service ]; then
+      sudo sed -i "s|^User=.*|User=\$REAL_USER|g" /etc/systemd/system/nexus.service 2>/dev/null || true
+      sudo sed -i "s|^ExecStart=.*|ExecStart=\$NODE_BIN /opt/nexus/dist/server.cjs|g" /etc/systemd/system/nexus.service 2>/dev/null || true
+      sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+    pkill -f "/opt/nexus/dist/server.cjs" 2>/dev/null || true
+    ensure_nexus_running
+    echo "[✓] Auto-reparación completada. Abre Nexus con: nexus"
     ;;
   version)
     echo "=============================================================================="
     echo "  NEXUS OS - ESTADO DE VERSIÓN E INTEGRIDAD DE DATOS"
     echo "=============================================================================="
-    curl -s "http://localhost:\$PORT/api/version" && echo "" || echo "Servicio local no accesible en puerto \$PORT"
+    curl -s "http://127.0.0.1:\$PORT/api/version" && echo "" || echo "Servicio local no accesible en puerto \$PORT"
     if [ -f "\$DATA_DIR/nexus-vault.json" ]; then
       echo "  Vault de Datos: \$DATA_DIR/nexus-vault.json (SHA-256: \$(sha256sum "\$DATA_DIR/nexus-vault.json" | awk '{print \$1}'))"
     fi
@@ -178,7 +274,7 @@ case "\$1" in
     STAMP=\$(date +%Y%m%d_%H%M%S)
     SNAP="\$BACKUP_DIR/nexus-backup-\$STAMP.tar.gz"
     echo "[*] Volcando estado en memoria de la bóveda de datos antes del snapshot..."
-    curl -s "http://localhost:\$PORT/api/data-vault" -o "/tmp/nexus-vault-sync.json" 2>/dev/null || true
+    curl -s "http://127.0.0.1:\$PORT/api/data-vault" -o "/tmp/nexus-vault-sync.json" 2>/dev/null || true
     if [ -s "/tmp/nexus-vault-sync.json" ]; then
       sudo cp "/tmp/nexus-vault-sync.json" "\$DATA_DIR/nexus-vault.json"
       sudo chmod 600 "\$DATA_DIR/nexus-vault.json"
@@ -205,7 +301,8 @@ case "\$1" in
     fi
     echo "[*] Restaurando snapshot previo en /opt/nexus..."
     sudo tar -xzf "\$LATEST_SNAP" -C /opt/nexus
-    sudo systemctl restart "\$SERVICE"
+    sudo systemctl restart "\$SERVICE" 2>/dev/null || true
+    ensure_nexus_running
     echo "[✓] Rollback completado con éxito desde \$LATEST_SNAP."
     ;;
   update)
@@ -214,20 +311,24 @@ case "\$1" in
       TARGET_SCRIPT=\$(ls -t \\
         "\$USER_HOME"/Descargas/nexus-updater*.sh \\
         "\$USER_HOME"/Downloads/nexus-updater*.sh \\
+        /home/*/Descargas/nexus-updater*.sh \\
+        /home/*/Downloads/nexus-updater*.sh \\
         ~/Descargas/nexus-updater*.sh \\
         ~/Downloads/nexus-updater*.sh \\
         /tmp/nexus-updater*.sh \\
         ./nexus-updater*.sh \\
         "\$USER_HOME"/Descargas/nexus-installer*.sh \\
         "\$USER_HOME"/Downloads/nexus-installer*.sh \\
+        /home/*/Descargas/nexus-installer*.sh \\
+        /home/*/Downloads/nexus-installer*.sh \\
         2>/dev/null | head -n 1)
     fi
     if [ -n "\$TARGET_SCRIPT" ] && [ -f "\$TARGET_SCRIPT" ]; then
       echo "[*] Ejecutando actualizador atómico verificado desde: \$TARGET_SCRIPT"
       sudo NEXUS_USER="\$REAL_USER" bash "\$TARGET_SCRIPT" --update-only
     else
-      echo "[!] No se encontró nexus-updater.sh en \$USER_HOME/Descargas ni \$USER_HOME/Downloads."
-      echo "    1. Abre el panel de Debian en Nexus ('Nexus, abre el panel de Debian')"
+      echo "[!] No se encontró nexus-updater.sh en Descargas ni Downloads."
+      echo "    1. Pídele a Nexus: 'Nexus, abre el panel de Debian'"
       echo "    2. Pulsa 'Descargar Actualizador (nexus-updater.sh)'"
       echo "    3. Ejecuta de nuevo: nexus update"
       exit 1
@@ -243,31 +344,101 @@ case "\$1" in
     else
       echo "GEMINI_API_KEY=\"\$2\"" | sudo tee -a "\$ENV_FILE" >/dev/null
     fi
-    curl -s -X POST "http://localhost:\$PORT/api/runtime-config" -H "Content-Type: application/json" -d "{\\"apiKey\\":\\"\$2\\"}" >/dev/null 2>&1 || true
-    sudo systemctl restart "\$SERVICE"
-    echo "Clave GEMINI_API_KEY actualizada en tiempo real y servicio Nexus reiniciado."
+    sudo chmod 644 "\$ENV_FILE" 2>/dev/null || true
+    curl -s -X POST "http://127.0.0.1:\$PORT/api/runtime-config" -H "Content-Type: application/json" -d "{\\"apiKey\\":\\"\$2\\"}" >/dev/null 2>&1 || true
+    sudo systemctl restart "\$SERVICE" 2>/dev/null || true
+    ensure_nexus_running
+    echo "Clave GEMINI_API_KEY actualizada en tiempo real y servicio Nexus activo."
     ;;
   app|"")
-    systemctl is-active --quiet "\$SERVICE" 2>/dev/null || sudo systemctl start "\$SERVICE" 2>/dev/null || true
-    BROWSER_BIN=\$(command -v chromium || command -v google-chrome || command -v firefox-esr || echo "xdg-open")
-    if [[ "\$BROWSER_BIN" == *"chromium"* ]] || [[ "\$BROWSER_BIN" == *"chrome"* ]]; then
-      CHROME_FLAGS=(--app="http://localhost:\$PORT" --use-fake-ui-for-media-stream --enable-features=WebRTCPipeWireCapturer --start-maximized)
+    ensure_nexus_running
+    APP_URL="http://localhost:\$PORT"
+    BROWSER_BIN=\$(command -v chromium || command -v chromium-browser || command -v google-chrome || command -v google-chrome-stable || command -v brave-browser || command -v microsoft-edge || command -v firefox-esr || command -v firefox || command -v xdg-open || echo "")
+    if [ -z "\$BROWSER_BIN" ]; then
+      echo "[✓] Servidor Nexus activo en: \$APP_URL"
+      echo "    Abre esa dirección en tu navegador."
+      exit 0
+    fi
+
+    # Auto-detectar variables de sesión gráfica X11 / Wayland si se invocó con sudo o desde menú
+    REAL_UID="\$(id -u "\$REAL_USER" 2>/dev/null || echo 1000)"
+    if [ -z "\$XDG_RUNTIME_DIR" ] && [ -d "/run/user/\$REAL_UID" ]; then
+      export XDG_RUNTIME_DIR="/run/user/\$REAL_UID"
+    fi
+    if [ -z "\$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "/run/user/\$REAL_UID/bus" ]; then
+      export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$REAL_UID/bus"
+    fi
+    if [ -z "\$WAYLAND_DISPLAY" ] && [ -n "\$XDG_RUNTIME_DIR" ]; then
+      WL_SOCK=\$(ls "\$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\\.lock\$' | head -n 1)
+      if [ -n "\$WL_SOCK" ]; then
+        export WAYLAND_DISPLAY="\$(basename "\$WL_SOCK")"
+      fi
+    fi
+    if [ -z "\$DISPLAY" ]; then
+      X_SOCK=\$(ls /tmp/.X11-unix/X* 2>/dev/null | head -n 1)
+      if [ -n "\$X_SOCK" ]; then
+        X_NUM="\${X_SOCK#/tmp/.X11-unix/X}"
+        export DISPLAY=":\${X_NUM}"
+      else
+        export DISPLAY=":0"
+      fi
+    fi
+    if [ -z "\$XAUTHORITY" ]; then
+      for xa in "\$USER_HOME/.Xauthority" "/run/user/\$REAL_UID/gdm/Xauthority" /run/user/\$REAL_UID/.mutter-Xwaylandauth* /tmp/xauth_*; do
+        if [ -f "\$xa" ]; then
+          export XAUTHORITY="\$xa"
+          break
+        fi
+      done
+    fi
+
+    if [[ "\$BROWSER_BIN" == *"chromium"* ]] || [[ "\$BROWSER_BIN" == *"chrome"* ]] || [[ "\$BROWSER_BIN" == *"brave"* ]] || [[ "\$BROWSER_BIN" == *"edge"* ]]; then
+      PROFILE_DIR="\$USER_HOME/.config/nexus-app-profile"
+      mkdir -p "\$PROFILE_DIR" 2>/dev/null || true
+      # Limpiar SingletonLock huérfanos que impiden que Chromium inicie tras reinicio o ejecución con root
+      if ! pgrep -f "user-data-dir=\$PROFILE_DIR" >/dev/null 2>&1; then
+        rm -f "\$PROFILE_DIR/SingletonLock" "\$PROFILE_DIR/SingletonCookie" "\$PROFILE_DIR/SingletonSocket" 2>/dev/null || true
+      fi
+      CHROME_FLAGS=(
+        --app="\$APP_URL"
+        --user-data-dir="\$PROFILE_DIR"
+        --autoplay-policy=no-user-gesture-required
+        --enable-features=WebRTCPipeWireCapturer
+        --ozone-platform-hint=auto
+        --no-first-run
+        --no-default-browser-check
+        --start-maximized
+      )
       if [ "\$(id -u)" -eq 0 ]; then
-        if [ -n "\$SUDO_USER" ] && [ "\$SUDO_USER" != "root" ]; then
-          sudo -u "\$SUDO_USER" DISPLAY="\${DISPLAY:-:0}" "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
+        if [ -n "\$REAL_USER" ] && [ "\$REAL_USER" != "root" ] && id "\$REAL_USER" >/dev/null 2>&1; then
+          chown -R "\$REAL_USER:\$REAL_USER" "\$PROFILE_DIR" 2>/dev/null || true
+          sudo -u "\$REAL_USER" env \\
+            DISPLAY="\$DISPLAY" \\
+            WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
+            XAUTHORITY="\$XAUTHORITY" \\
+            XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \\
+            DBUS_SESSION_BUS_ADDRESS="\$DBUS_SESSION_BUS_ADDRESS" \\
+            "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
         else
-          "\$BROWSER_BIN" --no-sandbox --user-data-dir="/root/.config/nexus-chromium" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
+          "\$BROWSER_BIN" --no-sandbox "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
         fi
       else
         "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
       fi
+      echo "[✓] Abriendo interfaz de Nexus en \$APP_URL ..."
     else
-      "\$BROWSER_BIN" "http://localhost:\$PORT" >/dev/null 2>&1 &
+      if [ "\$(id -u)" -eq 0 ] && [ -n "\$REAL_USER" ] && [ "\$REAL_USER" != "root" ]; then
+        sudo -u "\$REAL_USER" env DISPLAY="\$DISPLAY" WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" XAUTHORITY="\$XAUTHORITY" XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" "\$BROWSER_BIN" "\$APP_URL" >/dev/null 2>&1 &
+      else
+        "\$BROWSER_BIN" "\$APP_URL" >/dev/null 2>&1 &
+      fi
+      echo "[✓] Abriendo Nexus en \$APP_URL ..."
     fi
     ;;
   *)
     echo "Comandos de Nexus CLI (Debian / Kali Linux):"
-    echo "  nexus              - Abre la interfaz gráfica de Nexus en modo App"
+    echo "  nexus              - Inicia el núcleo (si está apagado) y abre la interfaz gráfica de Nexus"
+    echo "  nexus doctor       - Repara permisos, servicio systemd y arranca Nexus automáticamente"
     echo "  nexus update       - Actualiza Nexus a la última versión sin perder datos ni .env"
     echo "  nexus backup       - Crea un backup firmado (SHA-256) de tus datos y configuración"
     echo "  nexus rollback     - Restaura instantáneamente la versión anterior si algo falla"
@@ -344,7 +515,7 @@ function saveResolvedGeminiApiKey(newKey: string): boolean {
       } else {
         content = (content ? content.trimEnd() + '\n' : '') + `GEMINI_API_KEY="${clean}"\n`;
       }
-      fs.writeFileSync(p, content, { encoding: 'utf8', mode: 0o600 });
+      fs.writeFileSync(p, content, { encoding: 'utf8', mode: 0o644 });
     } catch (e) {
       console.warn(`Could not write .env at ${p}:`, e);
     }
@@ -353,11 +524,21 @@ function saveResolvedGeminiApiKey(newKey: string): boolean {
 }
 
 async function startServer() {
+  const isProduction =
+    process.env.NODE_ENV === 'production' ||
+    (typeof __filename !== 'undefined' && __filename.endsWith('server.cjs')) ||
+    Boolean(process.argv[1] && process.argv[1].endsWith('server.cjs')) ||
+    fs.existsSync('/opt/nexus/dist/index.html');
+
+  if (isProduction) {
+    process.env.NODE_ENV = 'production';
+  }
+
   const app = express();
   const server = http.createServer(app);
   const io = new Server(server, {
     cors: {
-      origin: process.env.NODE_ENV === 'production' 
+      origin: isProduction
         ? false // Disable completely, serving from same origin
         : ['http://localhost:3000', 'http://127.0.0.1:3000'],
       methods: ["GET", "POST"]
@@ -491,9 +672,11 @@ async function startServer() {
   // Runtime configuration endpoint so compiled production builds on Debian/Kali always receive GEMINI_API_KEY
   app.get('/api/runtime-config', (_req, res) => {
     const apiKey = getResolvedGeminiApiKey(false);
+    const rawEnvKey = (process.env.GEMINI_API_KEY || '').trim();
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       apiKey,
+      proxyKey: rawEnvKey,
       hasStandaloneKey: Boolean(apiKey && !apiKey.startsWith('AQ.')),
     });
   });
@@ -507,6 +690,34 @@ async function startServer() {
     saveResolvedGeminiApiKey(rawKey);
     io.emit('api_key_updated', { updatedAt: Date.now() });
     res.json({ ok: true });
+  });
+
+  // Local Linux WAV speech synthesis fallback (espeak-ng / espeak) when browser speechSynthesis has no voices
+  app.post('/api/local-tts', (req, res) => {
+    const text = String(req.body?.text || '').trim().slice(0, 600);
+    if (!text) {
+      res.status(400).json({ error: 'Empty text' });
+      return;
+    }
+    const ttsBin = ['/usr/bin/espeak-ng', '/usr/bin/espeak'].find(p => fs.existsSync(p));
+    if (!ttsBin) {
+      res.status(404).json({ error: 'No local espeak-ng binary installed' });
+      return;
+    }
+    const chunks: Buffer[] = [];
+    const proc = spawn(ttsBin, ['-v', 'es', '-s', '168', '--stdout', text]);
+    proc.stdout.on('data', d => chunks.push(Buffer.from(d)));
+    proc.on('error', () => {
+      if (!res.headersSent) res.status(500).json({ error: 'TTS failed' });
+    });
+    proc.on('close', code => {
+      if (code === 0 && chunks.length > 0) {
+        res.setHeader('Content-Type', 'audio/wav');
+        res.send(Buffer.concat(chunks));
+      } else if (!res.headersSent) {
+        res.status(500).json({ error: 'TTS exited with code ' + code });
+      }
+    });
   });
 
   // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
@@ -565,7 +776,7 @@ async function startServer() {
     });
   });
 
-  // Stream live Nexus source code bundle (.tar.gz) for automated Debian/Kali .deb package installer
+  // Stream live Nexus source code + precompiled dist bundle (.tar.gz) for automated Debian/Kali .deb package installer
   app.get('/api/source-bundle.tar.gz', (_req, res) => {
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Disposition', 'attachment; filename="nexus-source.tar.gz"');
@@ -573,7 +784,7 @@ async function startServer() {
       '-czf', '-',
       '--exclude=node_modules',
       '--exclude=.git',
-      '--exclude=dist',
+      '--exclude=*.map',
       '--exclude=data',
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
@@ -594,7 +805,7 @@ async function startServer() {
 
   // Atomic Delta Updater Payload: Updates an existing /opt/nexus installation in ~10s without full reinstall
   // Guarantees 100% data integrity (.env + /opt/nexus/data/nexus-vault.json), SHA-256 verification,
-  // hardlink node_modules reuse (cp -al), health check, and automatic rollback on failure.
+  // pre-compiled dist/server.cjs + dist/index.html included, health check, and automatic rollback on failure.
   app.get('/api/updater-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
     const portParam = (req.query.port as string) || '3000';
@@ -604,7 +815,7 @@ async function startServer() {
       '-czf', '-',
       '--exclude=node_modules',
       '--exclude=.git',
-      '--exclude=dist',
+      '--exclude=*.map',
       '--exclude=data',
       '--exclude=.env',
       '--exclude=package-lock.json',
@@ -638,8 +849,19 @@ async function startServer() {
 set -e
 
 NEXUS_USER="\${NEXUS_USER:-${userParam}}"
-if [ "\$NEXUS_USER" = "root" ] && [ -n "\$SUDO_USER" ]; then
-  NEXUS_USER="\$SUDO_USER"
+DETECTED_USER="\${SUDO_USER:-}"
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(logname 2>/dev/null || true)"
+fi
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1; exit}' /etc/passwd 2>/dev/null || true)"
+fi
+if ! id "\$NEXUS_USER" >/dev/null 2>&1 || [ "\$NEXUS_USER" = "root" ]; then
+  if [ -n "\$DETECTED_USER" ] && id "\$DETECTED_USER" >/dev/null 2>&1; then
+    NEXUS_USER="\$DETECTED_USER"
+  else
+    NEXUS_USER="root"
+  fi
 fi
 INSTALL_DIR="/opt/nexus"
 DATA_DIR="/opt/nexus/data"
@@ -674,7 +896,8 @@ cleanup() {
 trap cleanup EXIT
 
 ENV_FILE="\${INSTALL_DIR}/.env"
-NEXUS_PORT="\$(grep -E '^PORT=' "\$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "${portParam}")"
+NEXUS_PORT="\$(grep -E '^PORT=' "\$ENV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '"\\047[:space:]')"
+NEXUS_PORT="\${NEXUS_PORT:-${portParam}}"
 
 echo "=============================================================================="
 echo "  NEXUS OS v${NEXUS_VERSION} - ACTUALIZACIÓN ATÓMICA DELTA (SIN REINSTALACIÓN COMPLETA)"
@@ -752,22 +975,23 @@ fi
 NEW_PKG_HASH=\$(sha256sum "\${STAGING_DIR}/package.json" | awk '{print \$1}')
 
 cd "\$STAGING_DIR"
-if [ -d "\${INSTALL_DIR}/node_modules" ] && [ "\$OLD_PKG_HASH" = "\$NEW_PKG_HASH" ]; then
-  echo "    -> package.json sin cambios: reutilizando node_modules mediante hardlinks (0s descarga)..."
-  cp -al "\${INSTALL_DIR}/node_modules" "\${STAGING_DIR}/node_modules"
+if [ -s "\${STAGING_DIR}/dist/server.cjs" ] && [ -s "\${STAGING_DIR}/dist/index.html" ]; then
+  echo "    -> Binarios precompilados auto-contenidos (dist/server.cjs + dist/index.html) verificados y listos (0s compilación)..."
 else
-  echo "    -> Detectadas nuevas dependencias en package.json: actualizando delta de node_modules..."
-  if [ -d "\${INSTALL_DIR}/node_modules" ]; then
-    cp -a "\${INSTALL_DIR}/node_modules" "\${STAGING_DIR}/node_modules"
+  if [ -d "\${INSTALL_DIR}/node_modules" ] && [ "\$OLD_PKG_HASH" = "\$NEW_PKG_HASH" ]; then
+    cp -al "\${INSTALL_DIR}/node_modules" "\${STAGING_DIR}/node_modules" 2>/dev/null || true
+  else
+    if [ -d "\${INSTALL_DIR}/node_modules" ]; then
+      cp -a "\${INSTALL_DIR}/node_modules" "\${STAGING_DIR}/node_modules" 2>/dev/null || true
+    fi
+    NODE_ENV=development npm install --include=dev --prefer-offline --no-audit --no-fund
   fi
-  npm install --prefer-offline --no-audit --no-fund
+  EXISTING_KEY=\$(grep -E '^GEMINI_API_KEY=' "\${STAGING_DIR}/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+  GEMINI_API_KEY="\$EXISTING_KEY" npm run build
 fi
 
-EXISTING_KEY=\$(grep -E '^GEMINI_API_KEY=' "\${STAGING_DIR}/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-GEMINI_API_KEY="\$EXISTING_KEY" npm run build
-
 if [ ! -s "\${STAGING_DIR}/dist/server.cjs" ] || [ ! -s "\${STAGING_DIR}/dist/index.html" ]; then
-  echo "[✗] Error: La compilación en staging no generó dist/server.cjs o dist/index.html."
+  echo "[✗] Error: No se encontró dist/server.cjs o dist/index.html en staging."
   echo "    Tu instalación actual en /opt/nexus NO ha sido modificada."
   exit 1
 fi
@@ -806,16 +1030,25 @@ chmod 755 /usr/bin/nexus
 if id "\$NEXUS_USER" >/dev/null 2>&1; then
   chown -R "\$NEXUS_USER:\$NEXUS_USER" "\$INSTALL_DIR"
 fi
+chmod 644 "\$ENV_FILE" 2>/dev/null || true
+NODE_BIN="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
+if [ -f /etc/systemd/system/nexus.service ]; then
+  sed -i "s|^User=.*|User=\${NEXUS_USER}|g" /etc/systemd/system/nexus.service 2>/dev/null || true
+  sed -i "s|^ExecStart=.*|ExecStart=\${NODE_BIN} /opt/nexus/dist/server.cjs|g" /etc/systemd/system/nexus.service 2>/dev/null || true
+fi
 
 echo "[5/5] Reiniciando servicio nexus.service y verificando Health-Check en vivo..."
 systemctl daemon-reload || true
-systemctl restart nexus.service
+systemctl restart nexus.service || true
 
 HEALTH_OK=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS "http://localhost:\${NEXUS_PORT}/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
+  if curl -fsS "http://127.0.0.1:\${NEXUS_PORT}/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
     HEALTH_OK=1
     break
+  fi
+  if [ "\$i" -eq 5 ]; then
+    /usr/bin/nexus start >/dev/null 2>&1 || true
   fi
   sleep 1
 done
@@ -848,7 +1081,7 @@ echo "==========================================================================
     });
   });
 
-  // Self-contained Debian & Kali Linux .deb package installer with embedded Base64 source code
+  // Self-contained Debian & Kali Linux .deb package installer with embedded Base64 source + precompiled dist
   // Avoids Cloud Run cookie proxy ("<!doctype html>") when executing from an external terminal
   app.get('/api/installer-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
@@ -859,7 +1092,7 @@ echo "==========================================================================
       '-czf', '-',
       '--exclude=node_modules',
       '--exclude=.git',
-      '--exclude=dist',
+      '--exclude=*.map',
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
       '.'
@@ -889,10 +1122,22 @@ echo "==========================================================================
 set -e
 
 NEXUS_USER="\${NEXUS_USER:-${user}}"
-if [ "\$NEXUS_USER" = "root" ] && [ -n "\$SUDO_USER" ]; then
-  NEXUS_USER="\$SUDO_USER"
+DETECTED_USER="\${SUDO_USER:-}"
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(logname 2>/dev/null || true)"
+fi
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  DETECTED_USER="\$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1; exit}' /etc/passwd 2>/dev/null || true)"
+fi
+if ! id "\$NEXUS_USER" >/dev/null 2>&1 || [ "\$NEXUS_USER" = "root" ]; then
+  if [ -n "\$DETECTED_USER" ] && id "\$DETECTED_USER" >/dev/null 2>&1; then
+    NEXUS_USER="\$DETECTED_USER"
+  else
+    NEXUS_USER="root"
+  fi
 fi
 NEXUS_PORT="\${NEXUS_PORT:-${port}}"
+NEXUS_PORT="\${NEXUS_PORT:-3000}"
 NEXUS_API_KEY="\${NEXUS_API_KEY:-\${GEMINI_API_KEY:-${activeApiKey}}}"
 
 # Preservar clave previa si ya existía en /opt/nexus/.env
@@ -918,21 +1163,6 @@ if [ "\$(id -u)" -ne 0 ]; then
   exec sudo NEXUS_USER="\$NEXUS_USER" NEXUS_PORT="\$NEXUS_PORT" NEXUS_API_KEY="\$NEXUS_API_KEY" bash "\$0" "\$@"
 fi
 
-if [ -z "\$NEXUS_API_KEY" ] && [ -c /dev/tty ]; then
-  echo ""
-  echo "------------------------------------------------------------------------------"
-  echo "  [Opcional] Si tienes una clave GEMINI_API_KEY (empieza por AIza...),"
-  echo "  pégala ahora. Si pulsas ENTER, Nexus funcionará en Modo Local"
-  echo "  y podrás configurarla en cualquier momento con: nexus apikey TU_CLAVE"
-  echo "------------------------------------------------------------------------------"
-  printf "  GEMINI_API_KEY [ENTER para Modo Local]: " > /dev/tty
-  read -t 25 -r INPUT_KEY < /dev/tty || true
-  echo "" > /dev/tty
-  if [ -n "\$INPUT_KEY" ]; then
-    NEXUS_API_KEY="\$INPUT_KEY"
-  fi
-fi
-
 if [ -f /etc/os-release ]; then
   . /etc/os-release
   echo "[1/6] Sistema detectado: \${PRETTY_NAME:-Debian/Kali Linux}"
@@ -940,18 +1170,19 @@ fi
 
 echo "[2/6] Instalando dependencias del sistema, audio/vídeo y empaquetado dpkg..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
+dpkg --configure -a 2>/dev/null || true
+apt-get update -y || true
 apt-get install -y curl wget git build-essential ca-certificates gnupg lsb-release \\
-  dpkg-dev alsa-utils pulseaudio v4l-utils xdg-utils \\
-  nmap dnsutils whois iproute2 net-tools
+  dpkg-dev alsa-utils espeak-ng speech-dispatcher v4l-utils xdg-utils psmisc \\
+  nmap dnsutils whois iproute2 net-tools || true
 
-if ! command -v chromium >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
-  apt-get install -y chromium || true
+if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+  apt-get install -y chromium || apt-get install -y chromium-browser || true
 fi
 
 echo "[3/6] Verificando Node.js 22 LTS (Repositorio NodeSource nodistro para Debian/Kali)..."
 NEED_NODE=0
-if ! command -v node >/dev/null 2>&1; then
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   NEED_NODE=1
 else
   NODE_MAJOR=\$(node -v | cut -d. -f1 | tr -d 'v')
@@ -962,13 +1193,13 @@ fi
 
 if [ "\${NEED_NODE}" -eq 1 ]; then
   mkdir -p /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes || true
   echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
+  apt-get update -y || true
+  apt-get install -y nodejs || apt-get install -y nodejs npm || true
 fi
 
-echo "[4/6] Extrayendo código fuente embebido de Nexus y compilando producción..."
+echo "[4/6] Extrayendo núcleo precompilado y código fuente embebido de Nexus..."
 rm -rf "\${BUILD_ROOT}"
 mkdir -p "\${PKG_DIR}/opt/nexus"
 mkdir -p "\${PKG_DIR}/DEBIAN"
@@ -986,12 +1217,18 @@ PORT=\${NEXUS_PORT}
 NODE_ENV=production
 GEMINI_API_KEY="\${NEXUS_API_KEY}"
 ENVEOF
-chmod 600 "\${PKG_DIR}/opt/nexus/.env"
+chmod 644 "\${PKG_DIR}/opt/nexus/.env"
 
-npm install --no-audit --no-fund
-GEMINI_API_KEY="\${NEXUS_API_KEY}" npm run build
+if [ -s "\${PKG_DIR}/opt/nexus/dist/server.cjs" ] && [ -s "\${PKG_DIR}/opt/nexus/dist/index.html" ]; then
+  echo "    -> Núcleo auto-contenido precompilado (dist/server.cjs + dist/index.html) listo para ejecución inmediata."
+else
+  echo "    -> Compilando producción localmente..."
+  NODE_ENV=development npm install --include=dev --no-audit --no-fund
+  GEMINI_API_KEY="\${NEXUS_API_KEY}" npm run build
+fi
 
 echo "[5/6] Construyendo paquete oficial nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb..."
+NODE_BIN="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
 cat << EOF > "\${PKG_DIR}/DEBIAN/control"
 Package: nexus-ai
 Version: \${PKG_VERSION}
@@ -999,7 +1236,7 @@ Section: utils
 Priority: optional
 Architecture: \${PKG_ARCH}
 Maintainer: Koko <koko@nexus.local>
-Depends: nodejs (>= 20), alsa-utils, v4l-utils, xdg-utils
+Recommends: nodejs, alsa-utils, espeak-ng, v4l-utils, xdg-utils
 Description: Nexus AI - Sistema Operativo Cognitivo y Agente para Debian y Kali Linux
 EOF
 
@@ -1018,8 +1255,10 @@ Wants=network-online.target
 Type=simple
 User=\${NEXUS_USER}
 WorkingDirectory=/opt/nexus
-EnvironmentFile=/opt/nexus/.env
-ExecStart=/usr/bin/node /opt/nexus/dist/server.cjs
+EnvironmentFile=-/opt/nexus/.env
+Environment=PORT=\${NEXUS_PORT}
+Environment=NODE_ENV=production
+ExecStart=\${NODE_BIN} /opt/nexus/dist/server.cjs
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -1050,14 +1289,23 @@ for grp in audio video plugdev netdev adm dialout wireshark kaboxer; do
     usermod -aG "\\\$grp" "\${NEXUS_USER}" || true
   fi
 done
+mkdir -p /opt/nexus/data
 cat << ENVEOF > /opt/nexus/.env
 PORT=\${NEXUS_PORT}
 NODE_ENV=production
 GEMINI_API_KEY="\${NEXUS_API_KEY}"
 ENVEOF
-chmod 600 /opt/nexus/.env
+chmod 644 /opt/nexus/.env
 if id "\${NEXUS_USER}" >/dev/null 2>&1; then
   chown -R "\${NEXUS_USER}:\${NEXUS_USER}" /opt/nexus
+  USER_HOME_DIR="\\\$(getent passwd "\${NEXUS_USER}" 2>/dev/null | cut -d: -f6)"
+  for ddir in "\\\$USER_HOME_DIR/Escritorio" "\\\$USER_HOME_DIR/Desktop"; do
+    if [ -d "\\\$ddir" ]; then
+      cp /usr/share/applications/nexus-ai.desktop "\\\$ddir/nexus-ai.desktop" 2>/dev/null || true
+      chmod 755 "\\\$ddir/nexus-ai.desktop" 2>/dev/null || true
+      chown "\${NEXUS_USER}:\${NEXUS_USER}" "\\\$ddir/nexus-ai.desktop" 2>/dev/null || true
+    fi
+  done
 fi
 systemctl daemon-reload || true
 systemctl enable --now nexus.service || true
@@ -1070,15 +1318,20 @@ cat << 'EOF' > "\${PKG_DIR}/DEBIAN/prerm"
 set -e
 systemctl stop nexus.service 2>/dev/null || true
 systemctl disable nexus.service 2>/dev/null || true
+pkill -f "/opt/nexus/dist/server.cjs" 2>/dev/null || true
 EOF
 chmod 755 "\${PKG_DIR}/DEBIAN/prerm"
 
 dpkg-deb --build --root-owner-group "\${PKG_DIR}" "\${BUILD_ROOT}/nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb"
 
 echo "[6/6] Instalando paquete nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb con dpkg..."
-dpkg -i "\${BUILD_ROOT}/nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb" || apt-get install -f -y
+dpkg -i "\${BUILD_ROOT}/nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb" || apt-get install -f -y || true
 cp "\${BUILD_ROOT}/nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb" "/opt/nexus/nexus-ai_\${PKG_VERSION}_\${PKG_ARCH}.deb" || true
 rm -rf "\${BUILD_ROOT}"
+
+# Garantizar que el servicio esté arrancado y abrir automáticamente la ventana de Nexus
+/usr/bin/nexus start || true
+/usr/bin/nexus app || true
 
 echo "=============================================================================="
 echo "  ¡PAQUETE 'nexus-ai' INSTALADO CON ÉXITO EN DEBIAN / KALI LINUX!"
@@ -1334,16 +1587,25 @@ echo "==========================================================================
   });
 
   // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  if (!isProduction) {
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static('dist', { index: false }));
+    const candidateDistDirs = [
+      path.resolve(process.cwd(), 'dist'),
+      '/opt/nexus/dist',
+      typeof __dirname !== 'undefined' ? __dirname : path.resolve(process.cwd(), 'dist'),
+    ];
+    const distDir = candidateDistDirs.find(d => fs.existsSync(path.join(d, 'index.html'))) || path.resolve(process.cwd(), 'dist');
+
+    app.use(express.static(distDir, { index: false }));
     app.get('*all', (_req, res) => {
-      const indexPath = path.resolve(process.cwd(), 'dist', 'index.html');
+      const indexPath = path.join(distDir, 'index.html');
       try {
         let html = fs.readFileSync(indexPath, 'utf8');
         const runtimeScript = `<script>window.__NEXUS_RUNTIME_CONFIG__ = ${JSON.stringify({ apiKey: getResolvedGeminiApiKey(false) })};</script>`;
@@ -1356,6 +1618,14 @@ echo "==========================================================================
       }
     });
   }
+
+  server.on('error', (err: any) => {
+    if (err?.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`);
+    } else {
+      console.error('Server error:', err);
+    }
+  });
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);

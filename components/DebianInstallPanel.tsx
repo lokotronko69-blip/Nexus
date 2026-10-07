@@ -90,12 +90,12 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
 
     // Short 1-line command for initial .deb installation
     const runDownloadedOneLiner = useMemo(() => {
-        return `sudo NEXUS_USER="${sysUser}" NEXUS_PORT="${port}" bash "$(ls -t ~/Descargas/nexus-installer*.sh ~/Downloads/nexus-installer*.sh ./nexus-installer*.sh 2>/dev/null | head -n 1)"`;
+        return `sudo NEXUS_USER="${sysUser}" NEXUS_PORT="${port}" bash "$(ls -t /home/*/Descargas/nexus-installer*.sh /home/*/Downloads/nexus-installer*.sh ~/Descargas/nexus-installer*.sh ~/Downloads/nexus-installer*.sh /tmp/nexus-installer*.sh ./nexus-installer*.sh 2>/dev/null | head -n 1)"`;
     }, [sysUser, port]);
 
     // Short 1-line command for zero-reinstall Atomic Update
     const runDownloadedUpdaterOneLiner = useMemo(() => {
-        return `sudo NEXUS_USER="${sysUser}" bash "$(ls -t ~/Descargas/nexus-updater*.sh ~/Downloads/nexus-updater*.sh ./nexus-updater*.sh 2>/dev/null | head -n 1)"`;
+        return `sudo NEXUS_USER="${sysUser}" bash "$(ls -t /home/*/Descargas/nexus-updater*.sh /home/*/Downloads/nexus-updater*.sh ~/Descargas/nexus-updater*.sh ~/Downloads/nexus-updater*.sh /tmp/nexus-updater*.sh ./nexus-updater*.sh 2>/dev/null | head -n 1)"`;
     }, [sysUser]);
 
     const handleDownloadSelfContainedInstaller = async () => {
