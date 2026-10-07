@@ -35,6 +35,9 @@ export const App: React.FC = () => {
     const [terminalInitialCmd, setTerminalInitialCmd] = useState<string | undefined>(undefined);
     const [notesInitialContent, setNotesInitialContent] = useState<string | undefined>(undefined);
     const [memories, setMemories] = useState<any[]>([]);
+    const [hudCommandInput, setHudCommandInput] = useState('');
+    const [lastSpokenMessage, setLastSpokenMessage] = useState<string | null>(null);
+    const [isLocalModeActive, setIsLocalModeActive] = useState(false);
 
     const isCameraActiveRef = useRef(false);
     const isScreenSharingRef = useRef(false);
@@ -111,7 +114,13 @@ export const App: React.FC = () => {
                 return String(a);
             }).join(' ');
             
-            if (msg.includes('[vite] failed to connect to websocket') || msg.includes('WebSocket closed without opened') || msg.includes('Failed to fetch')) {
+            if (
+                msg.includes('[vite] failed to connect to websocket') ||
+                msg.includes('WebSocket closed without opened') ||
+                msg.includes('Failed to fetch') ||
+                msg.includes('Offline recognition error') ||
+                msg.includes('SpeechRecognition')
+            ) {
                 return; // suppress silently
             }
             originalConsoleError.apply(console, args);
@@ -425,31 +434,43 @@ export const App: React.FC = () => {
                 }
             },
             speak: (text: string, lang = 'es-ES') => {
+                setLastSpokenMessage(text);
                 if ('speechSynthesis' in window) {
-                    window.speechSynthesis.cancel(); // Stop talking first
-                    const utterance = new SpeechSynthesisUtterance(text);
-                    utterance.lang = lang;
-                    const voices = window.speechSynthesis.getVoices();
-                    const defaultSpanishVoice =
-                        voices.find(v => v.lang === 'es-ES' && v.default) ||
-                        voices.find(v => v.lang === 'es-ES') ||
-                        voices.find(v => v.lang.startsWith('es'));
-                    if (defaultSpanishVoice) {
-                        utterance.voice = defaultSpanishVoice;
-                    }
-                    utterance.rate = 1.0;
-                    utterance.pitch = 1.0;
-                    utterance.onstart = () => {
+                    try {
+                        window.speechSynthesis.cancel(); // Stop talking first
+                        const utterance = new SpeechSynthesisUtterance(text);
+                        utterance.lang = lang;
+                        const voices = window.speechSynthesis.getVoices();
+                        const defaultSpanishVoice =
+                            voices.find(v => v.lang === 'es-ES' && v.default) ||
+                            voices.find(v => v.lang === 'es-ES') ||
+                            voices.find(v => v.lang.startsWith('es'));
+                        if (defaultSpanishVoice) {
+                            utterance.voice = defaultSpanishVoice;
+                        }
+                        utterance.rate = 1.0;
+                        utterance.pitch = 1.0;
                         setNexusStatus('SPEAKING');
-                    };
-                    utterance.onend = () => {
+                        const fallbackDuration = Math.min(Math.max(text.length * 55, 2200), 8500);
+                        const fallbackTimer = window.setTimeout(() => {
+                            setNexusStatus(prev => (prev === 'SPEAKING' ? 'LISTENING' : prev));
+                        }, fallbackDuration);
+                        utterance.onstart = () => {
+                            setNexusStatus('SPEAKING');
+                        };
+                        utterance.onend = () => {
+                            clearTimeout(fallbackTimer);
+                            setNexusStatus('LISTENING');
+                        };
+                        utterance.onerror = () => {
+                            clearTimeout(fallbackTimer);
+                            setNexusStatus('LISTENING');
+                        };
+                        window.speechSynthesis.speak(utterance);
+                        return "Hablando usando hardware local.";
+                    } catch {
                         setNexusStatus('LISTENING');
-                    };
-                    utterance.onerror = () => {
-                        setNexusStatus('LISTENING');
-                    };
-                    window.speechSynthesis.speak(utterance);
-                    return "Hablando usando hardware local.";
+                    }
                 }
                 return "speechSynthesis no soportado.";
             },
@@ -816,6 +837,11 @@ export const App: React.FC = () => {
     const handleDisconnect = useCallback(() => {
         stopCamera();
         stopScreenShare();
+        if (recognitionRef.current) {
+            const rec = recognitionRef.current;
+            recognitionRef.current = null;
+            try { rec.stop(); } catch (e) {}
+        }
         if (sessionPromiseRef.current) {
             sessionPromiseRef.current.then(session => {
                 try { session.close(); } catch(e) {}
@@ -868,6 +894,7 @@ export const App: React.FC = () => {
 
             if(outputTranscription?.text) {
                 setNexusStatus('SPEAKING');
+                setLastSpokenMessage(outputTranscription.text);
                 saveTranscript(outputTranscription.text, 'model');
             }
 
@@ -1524,236 +1551,262 @@ export const App: React.FC = () => {
     }, [startCamera, stopCamera, startScreenShare, stopScreenShare, startRecording, stopRecording]);
 
     // Función central para el modo local
+    const processLocalCommand = useCallback(async (rawText: string) => {
+        const transcript = (rawText || '').trim();
+        if (!transcript) return;
+        console.log("Nexus command:", transcript);
+        saveTranscript(transcript, 'user');
+
+        const lowerTranscript = transcript.toLowerCase();
+        if (/(muestra|abrir|abre|enséñame|ver|pon|activar?).*(consumo|cpu|memoria|latencia|rendimiento|telemetr)/i.test(lowerTranscript)) {
+            setShowTelemetryPanel(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Te abro el panel de telemetría en tiempo real con gráficos de Recharts, Koko.");
+            }
+            return;
+        }
+        if (/(cierra|quita|oculta|desactivar?).*(panel|consumo|telemetr|gráfic|grafic|métrica|metrica)/i.test(lowerTranscript) && !/debian/i.test(lowerTranscript)) {
+            setShowTelemetryPanel(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Panel de telemetría cerrado. De vuelta a la interfaz habitual.");
+            }
+            return;
+        }
+        if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete|actualizar|actualizador).*(debian|kali|linux)/i.test(lowerTranscript)) {
+            setShowDebianPanel(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Aquí tienes el panel con el instalador y actualizador atómico para Debian y Kali Linux, Koko.");
+            }
+            return;
+        }
+        if (/(cierra|cerrar|quita|quitar|oculta).*(debian|kali|instalador|comandos de instalación|comandos de instalacion)/i.test(lowerTranscript)) {
+            setShowDebianPanel(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Panel de instalación de Debian y Kali cerrado.");
+            }
+            return;
+        }
+        if (/(abre|abrir|lanzar|muestra).*(terminal|consola|shell)/i.test(lowerTranscript)) {
+            setShowTerminal(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Abriendo la terminal de comandos del sistema, Koko.");
+            }
+            return;
+        }
+        if (/(cierra|cerrar|quitar|oculta).*(terminal|consola|shell)/i.test(lowerTranscript)) {
+            setShowTerminal(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Terminal del sistema cerrada.");
+            }
+            return;
+        }
+        if (/(abre|abrir|lanzar|muestra).*(notas|bloc de notas|notepad|apuntes)/i.test(lowerTranscript)) {
+            setShowNotes(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Abriendo tu bloc de notas del sistema, Koko.");
+            }
+            return;
+        }
+        if (/(cierra|cerrar|quitar|oculta).*(notas|bloc de notas|notepad)/i.test(lowerTranscript)) {
+            setShowNotes(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Bloc de notas cerrado.");
+            }
+            return;
+        }
+        if (/(abre|abrir|lanzar|muestra).*(procesos|administrador de tareas|gestor de tareas)/i.test(lowerTranscript)) {
+            setShowProcessManager(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Abriendo el administrador de procesos del sistema.");
+            }
+            return;
+        }
+        if (/(cierra|cerrar|quitar|oculta).*(procesos|administrador de tareas)/i.test(lowerTranscript)) {
+            setShowProcessManager(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Administrador de procesos cerrado.");
+            }
+            return;
+        }
+        if (/(abre|abrir|lanzar|muestra).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
+            setShowCanvas(true);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Pizarra interactiva abierta.");
+            }
+            return;
+        }
+        if (/(cierra|cerrar|quitar|oculta).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
+            setShowCanvas(false);
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Pizarra cerrada.");
+            }
+            return;
+        }
+
+        const isLocalHttpOrigin =
+            typeof window !== 'undefined' &&
+            window.location.protocol === 'http:' &&
+            (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+        // Intentar contactar con LLM local (LM Studio / Ollama) cuando se ejecuta en entorno local HTTP
+        try {
+            if (!isLocalHttpOrigin) {
+                throw new Error('Use server-side local-assistant on HTTPS host');
+            }
+            const localBaseUrl = lmStudioUrl || 'http://localhost:1234';
+            const cleanUrl = localBaseUrl.replace(/\/$/, '').replace(/\/v1$/, '') + '/v1';
+
+            let lmModel = 'local-model';
+            try {
+                const mRes = await fetch(`${cleanUrl}/models`, { signal: AbortSignal.timeout(1200) });
+                if (mRes.ok) {
+                    const mData = await mRes.json();
+                    if (mData.data && mData.data.length > 0) {
+                        lmModel = mData.data[0].id;
+                    }
+                }
+            } catch (e) {}
+
+            const res = await fetch(`${cleanUrl}/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: lmModel,
+                    messages: [
+                        { role: 'system', content: 'Eres Nexus, una chica de barrio descarada, directa y sin filtros. Ahora estás funcionando en modo LOCAL SIN INTERNET. Responde de forma muy breve y directa.' },
+                        { role: 'user', content: transcript }
+                    ],
+                    temperature: 0.7,
+                    max_tokens: 150
+                })
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                const reply = data.choices?.[0]?.message?.content || "No sé qué decirte.";
+                saveTranscript(reply, 'model');
+                if ((window as any).nexus?.speak) {
+                    (window as any).nexus.speak(reply);
+                }
+            } else {
+                const cleanOllamaUrl = (ollamaUrl || 'http://localhost:11434').replace(/\/$/, '');
+                let ollamaModel = 'llama3';
+                try {
+                    const tRes = await fetch(`${cleanOllamaUrl}/api/tags`, { signal: AbortSignal.timeout(1200) });
+                    if (tRes.ok) {
+                        const tData = await tRes.json();
+                        if (tData.models && tData.models.length > 0) {
+                            ollamaModel = tData.models[0].name;
+                        }
+                    }
+                } catch (e) {}
+
+                const ollamaRes = await fetch(`${cleanOllamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: ollamaModel,
+                        prompt: `Eres Nexus, una chica de barrio descarada. Estás SIN CONEXIÓN. Mensaje: ${transcript}`,
+                        stream: false
+                    })
+                });
+                if (ollamaRes.ok) {
+                    const ollamaData = await ollamaRes.json();
+                    const reply = ollamaData.response || "No me sale nada.";
+                    saveTranscript(reply, 'model');
+                    if ((window as any).nexus?.speak) {
+                        (window as any).nexus.speak(reply);
+                    }
+                } else {
+                    throw new Error('Ni LM Studio ni Ollama respondieron correctamente');
+                }
+            }
+        } catch (e) {
+            try {
+                const localRes = await fetch('/api/local-assistant', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: transcript })
+                });
+                if (localRes.ok) {
+                    const localData = await localRes.json();
+                    const reply = localData.reply || `Te escucho Koko: ${transcript}`;
+                    saveTranscript(reply, 'model');
+                    if ((window as any).nexus?.speak) {
+                        (window as any).nexus.speak(reply);
+                    }
+                    return;
+                }
+            } catch {}
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("Te he escuchado alto y claro, Koko: " + transcript + ". Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos.");
+            }
+        }
+    }, [lmStudioUrl, ollamaUrl]);
+
     const startOfflineRecognition = useCallback(() => {
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
         if (!SpeechRecognition) {
-            console.warn("SpeechRecognition no soportado para modo local.");
             return;
         }
 
         if (recognitionRef.current) {
-            try { recognitionRef.current.stop(); } catch(e) {}
+            const prev = recognitionRef.current;
+            recognitionRef.current = null;
+            try { prev.stop(); } catch (e) {}
         }
 
         const recognition = new SpeechRecognition();
         recognition.lang = 'es-ES';
         recognition.interimResults = false;
         recognition.maxAlternatives = 1;
-        
+        let shouldRestartRecognition = true;
+
         recognition.onresult = async (event: any) => {
-            const transcript = event.results[0][0].transcript;
-            console.log("Offline transcript:", transcript);
-            saveTranscript(transcript, 'user');
-            
-            const lowerTranscript = transcript.toLowerCase();
-            if (/(muestra|abrir|abre|enséñame|ver|pon|activar?).*(consumo|cpu|memoria|latencia|rendimiento|telemetr)/i.test(lowerTranscript)) {
-                setShowTelemetryPanel(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Te abro el panel de telemetría en tiempo real con gráficos de Recharts, Koko.");
-                }
-                return;
-            }
-            if (/(cierra|quita|oculta|desactivar?).*(panel|consumo|telemetr|gráfic|grafic|métrica|metrica)/i.test(lowerTranscript) && !/debian/i.test(lowerTranscript)) {
-                setShowTelemetryPanel(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Panel de telemetría cerrado. De vuelta a la interfaz habitual.");
-                }
-                return;
-            }
-            if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete|actualizar|actualizador).*(debian|kali|linux)/i.test(lowerTranscript)) {
-                setShowDebianPanel(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Aquí tienes el panel con el instalador y actualizador atómico para Debian y Kali Linux, Koko.");
-                }
-                return;
-            }
-            if (/(cierra|cerrar|quita|quitar|oculta).*(debian|kali|instalador|comandos de instalación|comandos de instalacion)/i.test(lowerTranscript)) {
-                setShowDebianPanel(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Panel de instalación de Debian y Kali cerrado.");
-                }
-                return;
-            }
-            if (/(abre|abrir|lanzar|muestra).*(terminal|consola|shell)/i.test(lowerTranscript)) {
-                setShowTerminal(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Abriendo la terminal de comandos del sistema, Koko.");
-                }
-                return;
-            }
-            if (/(cierra|cerrar|quitar|oculta).*(terminal|consola|shell)/i.test(lowerTranscript)) {
-                setShowTerminal(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Terminal del sistema cerrada.");
-                }
-                return;
-            }
-            if (/(abre|abrir|lanzar|muestra).*(notas|bloc de notas|notepad|apuntes)/i.test(lowerTranscript)) {
-                setShowNotes(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Abriendo tu bloc de notas del sistema, Koko.");
-                }
-                return;
-            }
-            if (/(cierra|cerrar|quitar|oculta).*(notas|bloc de notas|notepad)/i.test(lowerTranscript)) {
-                setShowNotes(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Bloc de notas cerrado.");
-                }
-                return;
-            }
-            if (/(abre|abrir|lanzar|muestra).*(procesos|administrador de tareas|gestor de tareas)/i.test(lowerTranscript)) {
-                setShowProcessManager(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Abriendo el administrador de procesos del sistema.");
-                }
-                return;
-            }
-            if (/(cierra|cerrar|quitar|oculta).*(procesos|administrador de tareas)/i.test(lowerTranscript)) {
-                setShowProcessManager(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Administrador de procesos cerrado.");
-                }
-                return;
-            }
-            if (/(abre|abrir|lanzar|muestra).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
-                setShowCanvas(true);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Pizarra interactiva abierta.");
-                }
-                return;
-            }
-            if (/(cierra|cerrar|quitar|oculta).*(pizarra|canvas|lienzo|dibujo)/i.test(lowerTranscript)) {
-                setShowCanvas(false);
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Pizarra cerrada.");
-                }
-                return;
-            }
-            
-            // Intentar contactar con LLM local para obtener respuesta
-            try {
-                // Primero probamos LM Studio
-                const localBaseUrl = lmStudioUrl || 'http://localhost:1234';
-                const cleanUrl = localBaseUrl.replace(/\/$/, '').replace(/\/v1$/, '') + '/v1';
-                
-                // Detectar modelo activo en LM Studio
-                let lmModel = 'local-model';
-                try {
-                    const mRes = await fetch(`${cleanUrl}/models`, { signal: AbortSignal.timeout(1200) });
-                    if (mRes.ok) {
-                        const mData = await mRes.json();
-                        if (mData.data && mData.data.length > 0) {
-                            lmModel = mData.data[0].id;
-                        }
-                    }
-                } catch(e) {}
-
-                const res = await fetch(`${cleanUrl}/chat/completions`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: lmModel,
-                        messages: [
-                            { role: 'system', content: 'Eres Nexus, una chica de barrio descarada, directa y sin filtros. Ahora estás funcionando en modo LOCAL SIN INTERNET. Responde de forma muy breve y directa.' },
-                            { role: 'user', content: transcript }
-                        ],
-                        temperature: 0.7,
-                        max_tokens: 150
-                    })
-                });
-                
-                if (res.ok) {
-                    const data = await res.json();
-                    const reply = data.choices?.[0]?.message?.content || "No sé qué decirte.";
-                    saveTranscript(reply, 'model');
-                    if ((window as any).nexus && (window as any).nexus.speak) {
-                        (window as any).nexus.speak(reply);
-                    }
-                } else {
-                    // O intentar con Ollama
-                    const cleanOllamaUrl = (ollamaUrl || 'http://localhost:11434').replace(/\/$/, '');
-                    let ollamaModel = 'llama3';
-                    try {
-                        const tRes = await fetch(`${cleanOllamaUrl}/api/tags`, { signal: AbortSignal.timeout(1200) });
-                        if (tRes.ok) {
-                            const tData = await tRes.json();
-                            if (tData.models && tData.models.length > 0) {
-                                ollamaModel = tData.models[0].name;
-                            }
-                        }
-                    } catch(e) {}
-
-                    const ollamaRes = await fetch(`${cleanOllamaUrl}/api/generate`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model: ollamaModel,
-                            prompt: `Eres Nexus, una chica de barrio descarada. Estás SIN CONEXIÓN. Mensaje: ${transcript}`,
-                            stream: false
-                        })
-                    });
-                    if (ollamaRes.ok) {
-                        const ollamaData = await ollamaRes.json();
-                        const reply = ollamaData.response || "No me sale nada.";
-                        saveTranscript(reply, 'model');
-                        if ((window as any).nexus && (window as any).nexus.speak) {
-                            (window as any).nexus.speak(reply);
-                        }
-                    } else {
-                        throw new Error('Ni LM Studio ni Ollama respondieron correctamente');
-                    }
-                }
-            } catch (e) {
-                console.warn("Fallo el LLM local, usando motor local de Nexus:", e);
-                try {
-                    const localRes = await fetch('/api/local-assistant', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ query: transcript })
-                    });
-                    if (localRes.ok) {
-                        const localData = await localRes.json();
-                        const reply = localData.reply || `Te escucho Koko: ${transcript}`;
-                        saveTranscript(reply, 'model');
-                        if ((window as any).nexus && (window as any).nexus.speak) {
-                            (window as any).nexus.speak(reply);
-                        }
-                        return;
-                    }
-                } catch {}
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Te he escuchado alto y claro, Koko: " + transcript + ". Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos.");
-                }
+            const transcript = event.results?.[0]?.[0]?.transcript;
+            if (transcript) {
+                await processLocalCommand(transcript);
             }
         };
 
         recognition.onend = () => {
-            // Keep listening in offline/local mode
-            if (recognitionRef.current) {
+            if (shouldRestartRecognition && recognitionRef.current === recognition) {
                 setTimeout(() => {
-                    try { 
-                        if (recognitionRef.current) {
-                            recognitionRef.current.start(); 
+                    try {
+                        if (shouldRestartRecognition && recognitionRef.current === recognition) {
+                            recognition.start();
                         }
-                    } catch(e) {}
-                }, 800);
+                    } catch (e) {}
+                }, 1000);
             }
         };
-        
+
         recognition.onerror = (event: any) => {
-            if (event.error !== 'no-speech') {
-                console.error("Offline recognition error:", event.error);
+            const errCode = String(event?.error || '');
+            // In Chromium on Debian/Kali or inside cross-origin iframes, browser SpeechRecognition
+            // may return 'network', 'not-allowed', or 'service-not-allowed'. Stop restarting so it never loops.
+            if (
+                errCode === 'network' ||
+                errCode === 'not-allowed' ||
+                errCode === 'service-not-allowed' ||
+                errCode === 'audio-capture' ||
+                errCode === 'language-not-supported'
+            ) {
+                shouldRestartRecognition = false;
+                if (recognitionRef.current === recognition) {
+                    recognitionRef.current = null;
+                }
             }
         };
 
         try {
-            recognition.start();
             recognitionRef.current = recognition;
-        } catch(e) {
-            console.error("Error starting offline recognition", e);
+            recognition.start();
+        } catch (e) {
+            shouldRestartRecognition = false;
+            recognitionRef.current = null;
         }
-    }, [lmStudioUrl, ollamaUrl]);
+    }, [processLocalCommand]);
 
     const connect = useCallback(async () => {
         // Ensure clean slate
@@ -1873,11 +1926,12 @@ export const App: React.FC = () => {
                 sessionPromiseRef.current = sessionPromise;
                 sessionRef.current = await sessionPromise;
             } catch (connectionError: any) {
-                console.error("Failed to connect to Nexus:", connectionError);
+                console.warn("Failed to connect to Nexus:", connectionError);
                 let errorMessage = connectionError.message || "Error desconocido al conectar.";
                 
                 if (errorMessage.includes("API_KEY") || /API key|not valid|UNAUTHENTICATED|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
                     setLastError(null);
+                    setIsLocalModeActive(true);
                     setNexusStatus('LISTENING');
                     startOfflineRecognition();
                     return;
@@ -1982,11 +2036,15 @@ export const App: React.FC = () => {
             // Everything is ready
             setNexusStatus('LISTENING');
             if ((sessionRef.current as any)?.isLocalSession) {
+                setIsLocalModeActive(true);
                 setLastError(null);
                 startOfflineRecognition();
                 if ((window as any).nexus?.speak) {
-                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy instalada y activa en tu sistema Linux. Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos cuando quieras.");
+                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy activa en tu sistema. Pídeme por voz o escribe abajo para abrir la terminal, la telemetría, el instalador de Debian/Kali, las notas o el gestor de procesos.");
                 }
+            } else {
+                setIsLocalModeActive(false);
+                setLastSpokenMessage("Conexión en vivo establecida con Nexus. Háblame o escribe un comando.");
             }
 
         } catch (error: any) {
@@ -2022,7 +2080,7 @@ export const App: React.FC = () => {
                     if (recognitionRef.current) {
                         try { recognitionRef.current.stop(); } catch(e) {}
                     }
-                    connect().catch(err => console.error("Online reconnection error:", err));
+                    connect().catch(err => console.warn("Online reconnection error:", err));
                 }
             }
         };
@@ -2042,7 +2100,7 @@ export const App: React.FC = () => {
         const handleReconnect = () => {
             if (hasGrantedAccess && navigator.onLine) {
                 setLastError("La sesión expiró por límite de tiempo. Reconectando...");
-                connect().catch(err => console.error("Reconnection error (event):", err));
+                connect().catch(err => console.warn("Reconnection error (event):", err));
             }
         };
 
@@ -2110,7 +2168,7 @@ export const App: React.FC = () => {
                             }
                             setHasGrantedAccess(true);
                             connect().catch(err => {
-                                console.error("Initial connect error:", err);
+                                console.warn("Initial connect error:", err);
                                 setNexusStatus('OFFLINE');
                                 setLastError(`Error al iniciar conexión: ${err.message || err}`);
                             });
@@ -2150,6 +2208,109 @@ export const App: React.FC = () => {
             )}
             
             <VoiceVisualizer status={nexusStatus} inputAnalyser={inputAnalyser} outputAnalyser={outputAnalyser} />
+
+            {/* Top Nexus HUD Status Header */}
+            <div className="absolute top-5 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none select-none">
+                <div className="flex items-center gap-3 px-4 py-2 rounded-full bg-zinc-950/80 border border-zinc-800/90 backdrop-blur-md shadow-[0_0_30px_rgba(14,165,233,0.15)]">
+                    <span
+                        className={`w-2.5 h-2.5 rounded-full ${
+                            nexusStatus === 'SPEAKING'
+                                ? 'bg-fuchsia-400 animate-ping'
+                                : nexusStatus === 'THINKING'
+                                ? 'bg-purple-400 animate-pulse'
+                                : nexusStatus === 'CONNECTING'
+                                ? 'bg-sky-400 animate-ping'
+                                : 'bg-emerald-400 animate-pulse'
+                        }`}
+                    />
+                    <span className="text-xs font-mono uppercase tracking-widest text-zinc-200 font-semibold">
+                        {nexusStatus === 'CONNECTING'
+                            ? 'NEXUS · INICIANDO NÚCLEO...'
+                            : nexusStatus === 'SPEAKING'
+                            ? 'NEXUS · HABLANDO'
+                            : nexusStatus === 'THINKING'
+                            ? 'NEXUS · PROCESANDO'
+                            : isLocalModeActive
+                            ? 'NEXUS OS · MODO LOCAL ACTIVO'
+                            : 'NEXUS LIVE · ESCUCHANDO'}
+                    </span>
+                </div>
+            </div>
+
+            {/* Bottom Interactive Nexus Command Bar & Subtitle HUD */}
+            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-4 flex flex-col items-center gap-3 pointer-events-auto">
+                {lastSpokenMessage && (
+                    <div className="w-full px-4 py-2.5 rounded-2xl bg-zinc-950/85 border border-fuchsia-500/30 backdrop-blur-md text-center shadow-lg">
+                        <p className="text-xs md:text-sm text-zinc-200 leading-relaxed">
+                            <span className="text-fuchsia-400 font-bold mr-1.5">NEXUS:</span>
+                            {lastSpokenMessage}
+                        </p>
+                    </div>
+                )}
+
+                <form
+                    onSubmit={(e) => {
+                        e.preventDefault();
+                        const cmd = hudCommandInput.trim();
+                        if (!cmd) return;
+                        setHudCommandInput('');
+                        processLocalCommand(cmd);
+                    }}
+                    className="w-full flex items-center gap-2 bg-zinc-950/85 border border-zinc-800 hover:border-zinc-700 focus-within:border-sky-500/60 rounded-full px-4 py-2 backdrop-blur-md shadow-[0_0_35px_rgba(0,0,0,0.7)] transition-colors"
+                >
+                    <input
+                        type="text"
+                        value={hudCommandInput}
+                        onChange={(e) => setHudCommandInput(e.target.value)}
+                        placeholder="Háblale a Nexus o escribe un comando (ej: abre terminal, telemetría, debian, estado)..."
+                        className="flex-1 bg-transparent text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none px-2"
+                    />
+                    <button
+                        type="submit"
+                        className="px-4 py-1.5 rounded-full bg-gradient-to-r from-sky-500 to-fuchsia-500 text-white text-xs font-bold uppercase tracking-wider hover:opacity-90 active:scale-95 transition-all"
+                    >
+                        Enviar
+                    </button>
+                </form>
+
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                    <button
+                        type="button"
+                        onClick={() => setShowDebianPanel(true)}
+                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-emerald-500/30 text-emerald-300 text-xs font-mono transition-colors"
+                    >
+                        Debian / Kali
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setShowTelemetryPanel(true)}
+                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-cyan-500/30 text-cyan-300 text-xs font-mono transition-colors"
+                    >
+                        Telemetría
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setShowTerminal(true)}
+                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-amber-500/30 text-amber-300 text-xs font-mono transition-colors"
+                    >
+                        Terminal
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setShowProcessManager(true)}
+                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-purple-500/30 text-purple-300 text-xs font-mono transition-colors"
+                    >
+                        Procesos
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setShowNotes(true)}
+                        className="px-3 py-1 rounded-full bg-zinc-900/80 hover:bg-zinc-800 border border-indigo-500/30 text-indigo-300 text-xs font-mono transition-colors"
+                    >
+                        Notas
+                    </button>
+                </div>
+            </div>
             
             {showCanvas && (
                 <div className="absolute inset-0 z-20 flex items-center justify-center p-8 bg-black/40 backdrop-blur-sm animate-fade-in">
