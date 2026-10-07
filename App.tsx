@@ -299,9 +299,9 @@ export const App: React.FC = () => {
                 if (id === 'telemetry' || id === 'hardware' || id === 'rendimiento') {
                     setShowTelemetryPanel(true);
                     return "Panel de telemetría de hardware abierto.";
-                } else if (id === 'debian_install' || id === 'debian' || id === 'instalador' || id === 'linux') {
+                } else if (id === 'debian_install' || id === 'debian' || id === 'kali' || id === 'instalador' || id === 'linux') {
                     setShowDebianPanel(true);
-                    return "Panel con todos los comandos para instalar Nexus en Debian abierto.";
+                    return "Panel de instalación de paquete (.deb) para Debian y Kali Linux abierto.";
                 } else if (id === 'terminal' || id === 'consola' || id === 'shell') {
                     if (params) setTerminalInitialCmd(params);
                     setShowTerminal(true);
@@ -351,9 +351,9 @@ export const App: React.FC = () => {
                 if (id === 'telemetry' || id === 'hardware' || id === 'rendimiento') {
                     setShowTelemetryPanel(false);
                     return "Panel de telemetría cerrado.";
-                } else if (id === 'debian_install' || id === 'debian' || id === 'instalador' || id === 'linux') {
+                } else if (id === 'debian_install' || id === 'debian' || id === 'kali' || id === 'instalador' || id === 'linux') {
                     setShowDebianPanel(false);
-                    return "Panel de instalación en Debian cerrado.";
+                    return "Panel de instalación en Debian y Kali Linux cerrado.";
                 } else if (id === 'terminal' || id === 'consola' || id === 'shell') {
                     setShowTerminal(false);
                     return "Terminal del sistema cerrada.";
@@ -388,18 +388,16 @@ export const App: React.FC = () => {
                     { id: 'screen', name: 'Captura de Pantalla', description: 'Compartición de pantallas del sistema', isOpen: isScreenSharingRef.current }
                 ];
             },
-            changeVoice: (voiceName: string) => {
-                setCurrentNexusVoice(voiceName);
-                setTimeout(() => window.dispatchEvent(new Event('nexus-reconnect')), 400);
-                return `Voz de Nexus cambiada a ${getCurrentNexusVoice()} por orden de Koko. Reconectando canal de audio...`;
+            changeVoice: (_voiceName?: string) => {
+                resetToDefaultNexusVoice();
+                return `La voz de Nexus está bloqueada permanentemente en su voz predeterminada (${DEFAULT_NEXUS_VOICE}).`;
             },
             resetVoice: () => {
                 resetToDefaultNexusVoice();
-                setTimeout(() => window.dispatchEvent(new Event('nexus-reconnect')), 400);
-                return `Voz de Nexus restablecida a su voz por defecto de siempre (${DEFAULT_NEXUS_VOICE}).`;
+                return `Voz de Nexus fijada en su voz predeterminada (${DEFAULT_NEXUS_VOICE}).`;
             },
             getVoice: () => {
-                return getCurrentNexusVoice();
+                return DEFAULT_NEXUS_VOICE;
             },
             getDisplayInfo: async () => {
                 try {
@@ -431,6 +429,14 @@ export const App: React.FC = () => {
                     window.speechSynthesis.cancel(); // Stop talking first
                     const utterance = new SpeechSynthesisUtterance(text);
                     utterance.lang = lang;
+                    const voices = window.speechSynthesis.getVoices();
+                    const defaultSpanishVoice =
+                        voices.find(v => v.lang === 'es-ES' && v.default) ||
+                        voices.find(v => v.lang === 'es-ES') ||
+                        voices.find(v => v.lang.startsWith('es'));
+                    if (defaultSpanishVoice) {
+                        utterance.voice = defaultSpanishVoice;
+                    }
                     utterance.rate = 1.0;
                     utterance.pitch = 1.0;
                     utterance.onstart = () => {
@@ -1147,16 +1153,9 @@ export const App: React.FC = () => {
                     } else if (fc.name === NexusFunctionDeclarations.retrieveMemories.name) {
                         const query = fc.args.query as string | undefined;
                         result = await getAllMemoriesFromStorage(query);
-                    } else if (fc.name === NexusFunctionDeclarations.changeVoice?.name) {
-                        const voiceName = (fc.args.voiceName as string) || DEFAULT_NEXUS_VOICE;
-                        if (/defecto|normal|siempre|original|kore/i.test(voiceName)) {
-                            resetToDefaultNexusVoice();
-                            result = `¡Oído cocina, Koko! Vuelvo a mi voz por defecto de siempre (${DEFAULT_NEXUS_VOICE}). Reiniciando canal de audio...`;
-                        } else {
-                            setCurrentNexusVoice(voiceName);
-                            result = `¡Oído cocina, Koko! Cambio mi voz a ${getCurrentNexusVoice()} como me has pedido. Reiniciando canal de audio...`;
-                        }
-                        setTimeout(() => window.dispatchEvent(new Event('nexus-reconnect')), 400);
+                    } else if (fc.name === 'changeVoice') {
+                        resetToDefaultNexusVoice();
+                        result = `Voz predeterminada (${DEFAULT_NEXUS_VOICE}) mantenida de forma permanente. Prohibido cambiar de voz.`;
                     } else if (fc.name === NexusFunctionDeclarations.toggleCanvas?.name) {
                         const show = fc.args.active as boolean;
                         setShowCanvas(show);
@@ -1632,6 +1631,12 @@ export const App: React.FC = () => {
                     },
                     onclose: (e: CloseEvent) => {
                         console.log('Conexión cerrada:', e.code, e.reason);
+                        if (e.code === 1008 || /API_KEY|authentication|credential/i.test(String(e.reason || ''))) {
+                            setLastError(null);
+                            setNexusStatus('LISTENING');
+                            startOfflineRecognition();
+                            return;
+                        }
                         if(e.code !== 1000) {
                             let reason = e.reason || "Desconocida";
                             if (e.code === 1006) reason = "Conexión interrumpida anormalmente (posible caída de red o error del servidor).";
@@ -1654,12 +1659,15 @@ export const App: React.FC = () => {
                 console.error("Failed to connect to Nexus:", connectionError);
                 let errorMessage = connectionError.message || "Error desconocido al conectar.";
                 
-                if (errorMessage.includes("The service is currently unavailable") || errorMessage.includes("503")) {
+                if (errorMessage.includes("API_KEY") || /UNAUTHENTICATED|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
+                    setLastError(null);
+                    setNexusStatus('LISTENING');
+                    startOfflineRecognition();
+                    return;
+                } else if (errorMessage.includes("The service is currently unavailable") || errorMessage.includes("503")) {
                     errorMessage = "El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.";
                 } else if (errorMessage.includes("Network error") || errorMessage.toLowerCase().includes("network")) {
                     errorMessage = "Hubo un problema de red al intentar conectar con los servidores. Verifica tu conexión a internet.";
-                } else if (errorMessage.includes("API_KEY")) {
-                    errorMessage = "Error con la clave de API. Revisa la configuración.";
                 }
                 
                 setLastError(`Error de conexión: ${errorMessage}`);
@@ -1760,6 +1768,13 @@ export const App: React.FC = () => {
 
             // Everything is ready
             setNexusStatus('LISTENING');
+            if ((sessionRef.current as any)?.isLocalSession) {
+                setLastError(null);
+                startOfflineRecognition();
+                if ((window as any).nexus?.speak) {
+                    (window as any).nexus.speak("¡Qué pasa, Koko! Ya estoy instalada y activa en tu sistema Linux. Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos cuando quieras.");
+                }
+            }
 
         } catch (error: any) {
             console.warn('Failed to connect:', error);
@@ -1768,7 +1783,10 @@ export const App: React.FC = () => {
             if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
                 errorMessage = 'Necesitamos permiso para usar el micrófono.';
             } else if (error.message?.includes('API_KEY')) {
-                errorMessage = 'Falta la API KEY.';
+                setLastError(null);
+                setNexusStatus('LISTENING');
+                startOfflineRecognition();
+                return;
             } else if (error.message?.includes('The service is currently unavailable') || error.message?.includes('503')) {
                 errorMessage = 'El servicio de Gemini no está disponible en este momento (503). Por favor, espera unos minutos e inténtalo de nuevo.';
             } else if (error.message?.includes('Network error') || error.message?.toLowerCase().includes('network')) {
@@ -1873,17 +1891,17 @@ export const App: React.FC = () => {
                 }
                 return;
             }
-            if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion).*(debian|linux)/i.test(lowerTranscript)) {
+            if (/(muestra|abrir|abre|enséñame|ver|pon|comandos|instalar|instalación|instalacion|paquete).*(debian|kali|linux)/i.test(lowerTranscript)) {
                 setShowDebianPanel(true);
                 if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Aquí tienes el panel con todos los comandos y el script para instalarme en Debian, Koko.");
+                    (window as any).nexus.speak("Aquí tienes el panel con el comando único de instalación en paquete para Debian y Kali Linux, Koko.");
                 }
                 return;
             }
-            if (/(cierra|cerrar|quita|quitar|oculta).*(debian|instalador|comandos de instalación|comandos de instalacion)/i.test(lowerTranscript)) {
+            if (/(cierra|cerrar|quita|quitar|oculta).*(debian|kali|instalador|comandos de instalación|comandos de instalacion)/i.test(lowerTranscript)) {
                 setShowDebianPanel(false);
                 if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Panel de instalación de Debian cerrado.");
+                    (window as any).nexus.speak("Panel de instalación de Debian y Kali cerrado.");
                 }
                 return;
             }
@@ -1941,29 +1959,6 @@ export const App: React.FC = () => {
                 if ((window as any).nexus && (window as any).nexus.speak) {
                     (window as any).nexus.speak("Pizarra cerrada.");
                 }
-                return;
-            }
-            if (/(cambia.*voz|pon.*voz|cambiar.*voz|vuelve.*voz)/i.test(lowerTranscript) || /(voz.*(defecto|normal|siempre|original|kore|puck|charon|fenrir|aoede))/i.test(lowerTranscript)) {
-                let targetVoice = DEFAULT_NEXUS_VOICE;
-                if (/puck/i.test(lowerTranscript)) targetVoice = 'Puck';
-                else if (/charon/i.test(lowerTranscript)) targetVoice = 'Charon';
-                else if (/fenrir/i.test(lowerTranscript)) targetVoice = 'Fenrir';
-                else if (/aoede/i.test(lowerTranscript)) targetVoice = 'Aoede';
-                else if (/kore/i.test(lowerTranscript) || /defecto|siempre|normal|original/i.test(lowerTranscript)) targetVoice = DEFAULT_NEXUS_VOICE;
-
-                if (targetVoice === DEFAULT_NEXUS_VOICE) {
-                    resetToDefaultNexusVoice();
-                } else {
-                    setCurrentNexusVoice(targetVoice);
-                }
-
-                const voiceMsg = targetVoice === DEFAULT_NEXUS_VOICE
-                    ? "Hecho, Koko. Vuelvo a mi voz por defecto de siempre (Kore)."
-                    : `Hecho, Koko. He cambiado mi voz a ${targetVoice} como me has pedido.`;
-                if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak(voiceMsg);
-                }
-                setTimeout(() => window.dispatchEvent(new Event('nexus-reconnect')), 400);
                 return;
             }
             
@@ -2041,10 +2036,25 @@ export const App: React.FC = () => {
                     }
                 }
             } catch (e) {
-                console.warn("Fallo el LLM local:", e);
-                // Fallback puro STT a TTS
+                console.warn("Fallo el LLM local, usando motor local de Nexus:", e);
+                try {
+                    const localRes = await fetch('/api/local-assistant', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: transcript })
+                    });
+                    if (localRes.ok) {
+                        const localData = await localRes.json();
+                        const reply = localData.reply || `Te escucho Koko: ${transcript}`;
+                        saveTranscript(reply, 'model');
+                        if ((window as any).nexus && (window as any).nexus.speak) {
+                            (window as any).nexus.speak(reply);
+                        }
+                        return;
+                    }
+                } catch {}
                 if ((window as any).nexus && (window as any).nexus.speak) {
-                    (window as any).nexus.speak("Te he escuchado Koko, has dicho: " + transcript + ". Pero ningún modelo local (LM Studio u Ollama) ha respondido.");
+                    (window as any).nexus.speak("Te he escuchado alto y claro, Koko: " + transcript + ". Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos.");
                 }
             }
         };

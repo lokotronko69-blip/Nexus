@@ -93,6 +93,7 @@ export const SystemTerminal: React.FC<SystemTerminalProps> = ({ onClose, onExecu
   echo <texto>      - Imprime texto en pantalla
   say <texto>       - Ordena a Nexus pronunciar el texto en voz alta
   voice [nombre]    - Muestra o cambia la voz (SOLO Koko puede cambiarla; por defecto: Kore)
+  apikey <clave>    - Actualiza en caliente GEMINI_API_KEY en /opt/nexus/.env y reconecta
   debian            - Abre el panel con todos los comandos para instalar Nexus en Debian
   exit / close      - Cierra la terminal`;
                 break;
@@ -206,30 +207,41 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                 break;
 
             case 'voice':
-                if (args.length === 0) {
-                    const current = (window as any).nexus?.getVoice ? (window as any).nexus.getVoice() : 'Kore';
-                    outputText = `CONFIGURACIÓN DE VOZ DE NEXUS:
-  Voz actual:        ${current} ${current === 'Kore' ? '(Por defecto)' : ''}
-  Voz por defecto:   Kore
-  Regla estricta:    Nexus NO PUEDE cambiar de voz por sí misma; debe mantener siempre la suya por defecto. SOLO Koko puede ordenarle cambiar de voz.
-  Voces del sistema: Kore (por defecto habitual), Puck, Charon, Fenrir, Aoede
-  Comandos:
-    voice <nombre>   - Cambia a una voz específica (ej: voice Puck)
-    voice default    - Restablece a la voz por defecto (Kore)`;
-                } else if (args[0] === 'default' || args[0] === 'reset' || args[0] === 'kore') {
-                    if ((window as any).nexus?.resetVoice) {
-                        outputText = (window as any).nexus.resetVoice();
-                    } else {
-                        outputText = 'Voz restablecida a la de siempre por defecto (Kore).';
-                    }
+                outputText = `CONFIGURACIÓN DE VOZ DE NEXUS:
+  Voz predeterminada fija: Kore (Bloqueada permanentemente)
+  Estado:                  Voz predeterminada activa e inmutable`;
+                break;
+
+            case 'apikey':
+            case 'nexus': {
+                const keyArg = command === 'nexus' && args[0]?.toLowerCase() === 'apikey' ? args[1] : (command === 'apikey' ? args[0] : '');
+                if (!keyArg) {
+                    outputText = 'Uso: apikey <TU_GEMINI_API_KEY> (o en tu terminal de Linux: nexus apikey <TU_GEMINI_API_KEY>)';
+                    outputType = 'system';
                 } else {
-                    if ((window as any).nexus?.changeVoice) {
-                        outputText = (window as any).nexus.changeVoice(args[0]);
-                    } else {
-                        outputText = `Voz actualizada a ${args[0]}.`;
+                    try {
+                        const r = await fetch('/api/runtime-config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ apiKey: keyArg })
+                        });
+                        if (r.ok) {
+                            outputText = 'Clave GEMINI_API_KEY guardada en /opt/nexus/.env y cargada en tiempo real. Reconectando con Gemini Live...';
+                            outputType = 'system';
+                            setTimeout(() => {
+                                window.dispatchEvent(new CustomEvent('nexus-reconnect'));
+                            }, 300);
+                        } else {
+                            outputText = 'No se pudo actualizar la clave en el servidor local.';
+                            outputType = 'error';
+                        }
+                    } catch {
+                        outputText = 'Error de red al guardar la clave en /api/runtime-config.';
+                        outputType = 'error';
                     }
                 }
                 break;
+            }
 
             case 'debian':
             case 'install-debian':
