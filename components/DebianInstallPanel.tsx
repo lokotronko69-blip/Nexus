@@ -8,9 +8,11 @@ import {
     Search,
     FileCode,
     Package,
-    CheckCircle2,
+    RefreshCw,
+    ShieldCheck,
     Loader2
 } from 'lucide-react';
+import { syncVaultWithServer } from '../services/geminiService';
 
 interface DebianInstallPanelProps {
     onClose: () => void;
@@ -19,7 +21,7 @@ interface DebianInstallPanelProps {
 interface CommandStep {
     id: string;
     number: string;
-    category: 'deb_package' | 'base' | 'node' | 'nexus' | ' local_ai';
+    category: 'update' | 'deb_package' | 'base' | 'node' | 'nexus' | 'local_ai';
     title: string;
     description: string;
     command: string;
@@ -28,7 +30,6 @@ interface CommandStep {
 }
 
 export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose }) => {
-    const [installPath, setInstallPath] = useState('/opt/nexus');
     const [sysUser, setSysUser] = useState('koko');
     const [port, setPort] = useState('3000');
     const [distroMode, setDistroMode] = useState<'universal' | 'kali' | 'debian'>('universal');
@@ -38,6 +39,11 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
     const [copiedShortCmd, setCopiedShortCmd] = useState(false);
     const [copiedFullPayload, setCopiedFullPayload] = useState(false);
     const [downloadedInstaller, setDownloadedInstaller] = useState(false);
+
+    // Atomic Updater states
+    const [copiedUpdateShortCmd, setCopiedUpdateShortCmd] = useState(false);
+    const [copiedUpdateFullPayload, setCopiedUpdateFullPayload] = useState(false);
+    const [downloadedUpdater, setDownloadedUpdater] = useState(false);
     const [completedSteps, setCompletedSteps] = useState<Record<string, boolean>>({});
 
     const [payloadData, setPayloadData] = useState<{
@@ -45,31 +51,55 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
         pasteCommand: string;
         sizeKB: number;
     } | null>(null);
+    const [updaterData, setUpdaterData] = useState<{
+        version: string;
+        payloadSha256: string;
+        updaterScript: string;
+        pasteUpdateCommand: string;
+        sizeKB: number;
+    } | null>(null);
+    const [versionInfo, setVersionInfo] = useState<{
+        version: string;
+        vaultChecksum?: string;
+        memoriesCount?: number;
+    } | null>(null);
     const [loadingPayload, setLoadingPayload] = useState(true);
 
     useEffect(() => {
         let active = true;
         setLoadingPayload(true);
-        fetch(`/api/installer-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' })
-            .then(r => r.json())
-            .then(data => {
-                if (active && data?.selfExtractingScript) {
-                    setPayloadData(data);
-                }
+        syncVaultWithServer().catch(() => {});
+
+        Promise.all([
+            fetch(`/api/installer-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
+            fetch(`/api/updater-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
+            fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        ])
+            .then(([instData, updData, verData]) => {
+                if (!active) return;
+                if (instData?.selfExtractingScript) setPayloadData(instData);
+                if (updData?.updaterScript) setUpdaterData(updData);
+                if (verData) setVersionInfo(verData);
             })
-            .catch(err => console.error('Error loading self-contained payload:', err))
+            .catch(err => console.error('Error loading installer/updater payloads:', err))
             .finally(() => {
                 if (active) setLoadingPayload(false);
             });
         return () => { active = false; };
     }, [sysUser, port]);
 
-    // Short 1-line command that automatically locates nexus-installer.sh in ~/Descargas, ~/Downloads or current dir
+    // Short 1-line command for initial .deb installation
     const runDownloadedOneLiner = useMemo(() => {
         return `sudo NEXUS_USER="${sysUser}" NEXUS_PORT="${port}" bash "$(ls -t ~/Descargas/nexus-installer*.sh ~/Downloads/nexus-installer*.sh ./nexus-installer*.sh 2>/dev/null | head -n 1)"`;
     }, [sysUser, port]);
 
-    const handleDownloadSelfContainedInstaller = () => {
+    // Short 1-line command for zero-reinstall Atomic Update
+    const runDownloadedUpdaterOneLiner = useMemo(() => {
+        return `sudo NEXUS_USER="${sysUser}" bash "$(ls -t ~/Descargas/nexus-updater*.sh ~/Downloads/nexus-updater*.sh ./nexus-updater*.sh 2>/dev/null | head -n 1)"`;
+    }, [sysUser]);
+
+    const handleDownloadSelfContainedInstaller = async () => {
+        await syncVaultWithServer().catch(() => {});
         if (!payloadData?.selfExtractingScript) return;
         const blob = new Blob([payloadData.selfExtractingScript], { type: 'text/x-shellscript;charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -82,6 +112,22 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
         URL.revokeObjectURL(url);
         setDownloadedInstaller(true);
         setTimeout(() => setDownloadedInstaller(false), 4000);
+    };
+
+    const handleDownloadAtomicUpdater = async () => {
+        await syncVaultWithServer().catch(() => {});
+        if (!updaterData?.updaterScript) return;
+        const blob = new Blob([updaterData.updaterScript], { type: 'text/x-shellscript;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'nexus-updater.sh';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        setDownloadedUpdater(true);
+        setTimeout(() => setDownloadedUpdater(false), 4000);
     };
 
     const handleCopyShortOneLiner = () => {
@@ -97,20 +143,64 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
         setTimeout(() => setCopiedFullPayload(false), 3000);
     };
 
+    const handleCopyUpdateShortOneLiner = () => {
+        navigator.clipboard.writeText(runDownloadedUpdaterOneLiner);
+        setCopiedUpdateShortCmd(true);
+        setTimeout(() => setCopiedUpdateShortCmd(false), 2500);
+    };
+
+    const handleCopyUpdateFullPayload = () => {
+        if (!updaterData?.pasteUpdateCommand) return;
+        navigator.clipboard.writeText(updaterData.pasteUpdateCommand);
+        setCopiedUpdateFullPayload(true);
+        setTimeout(() => setCopiedUpdateFullPayload(false), 3000);
+    };
+
     const steps: CommandStep[] = useMemo(() => [
         {
-            id: 'step-0-deb-pkg',
+            id: 'step-0-atomic-update',
             number: '01',
-            category: 'deb_package',
-            title: 'Ejecutar el Auto-Instalador de Paquete (.deb) en 1 Comando (Debian y Kali Linux)',
-            description: 'Una vez descargado el archivo auto-contenido "nexus-installer.sh" con el botón superior (que ya incluye todo el código fuente de Nexus en Base64 sin pasar por el bloqueo HTML del navegador), ejecuta este comando único en tu terminal:',
-            command: runDownloadedOneLiner,
-            verifyCommand: 'dpkg -l | grep nexus-ai && nexus status',
-            notes: 'Detecta automáticamente si tu carpeta se llama ~/Descargas o ~/Downloads y construye e instala nexus-ai_1.0.0_amd64.deb.'
+            category: 'update',
+            title: 'Actualización Atómica Delta sin Reinstalar (nexus-updater.sh / nexus update)',
+            description: 'Si ya tienes Nexus instalado en /opt/nexus, este método actualiza el sistema en ~10 segundos sin reinstalar paquetes APT ni tocar tu clave GEMINI_API_KEY (.env) ni tu bóveda de memorias y notas (/opt/nexus/data/nexus-vault.json). Reutiliza node_modules mediante hardlinks (cp -al), verifica SHA-256 y aplica Rollback Automático si falla el health-check:',
+            command: `# Opción 1: Descarga nexus-updater.sh con el botón verde superior y ejecuta:
+${runDownloadedUpdaterOneLiner}
+
+# Opción 2 (Si ya tienes el CLI actualizado): Simplemente ejecuta en tu terminal:
+nexus update`,
+            verifyCommand: 'nexus version && curl -s http://localhost:3000/api/health',
+            notes: `Hash SHA-256 verificado del paquete actual: ${updaterData?.payloadSha256?.slice(0, 24) || 'verificando'}...`
         },
         {
-            id: 'step-1-apt',
+            id: 'step-1-backup-rollback',
             number: '02',
+            category: 'update',
+            title: 'Snapshots Criptográficos SHA-256 y Rollback Instantáneo (nexus backup / rollback)',
+            description: 'Cada vez que actualizas Nexus, se crea automáticamente un snapshot firmado con SHA-256 en /var/backups/nexus/ (conservando las últimas 5 versiones). También puedes crear un backup manual o volver a la versión anterior en 2 segundos:',
+            command: `# Crear un backup manual firmado (SHA-256) de .env, bóveda de datos y binarios:
+nexus backup
+
+# Ver versión instalada, hash SHA-256 de la bóveda de memorias y snapshots disponibles:
+nexus version
+
+# Restaurar instantáneamente la versión anterior verificando su firma SHA-256:
+nexus rollback`,
+            verifyCommand: 'ls -lh /var/backups/nexus/',
+            notes: 'Garantiza cero pérdida de datos incluso ante cortes eléctricos o fallos de compilación.'
+        },
+        {
+            id: 'step-2-deb-pkg',
+            number: '03',
+            category: 'deb_package',
+            title: 'Primera Instalación de Paquete Nativo (.deb) en 1 Comando (Debian y Kali Linux)',
+            description: 'Para instalar Nexus por primera vez en un sistema limpio, descarga "nexus-installer.sh" con el botón superior y ejecuta este comando único en tu terminal:',
+            command: runDownloadedOneLiner,
+            verifyCommand: 'dpkg -l | grep nexus-ai && nexus status',
+            notes: 'Detecta automáticamente ~/Descargas o ~/Downloads y construye e instala nexus-ai_1.0.0_amd64.deb.'
+        },
+        {
+            id: 'step-3-apt',
+            number: '04',
             category: 'base',
             title: 'Dependencias Base, Multimedia y Herramientas de Kali / Debian',
             description: 'Instala compiladores, soporte de empaquetado dpkg-dev, audio/vídeo (ALSA, PulseAudio, V4L2) y utilidades de red/ciberseguridad para Nexus.',
@@ -122,8 +212,8 @@ sudo apt install -y curl wget git build-essential ca-certificates gnupg lsb-rele
             notes: 'Compatible con Kali Linux Rolling, Kali Purple, Debian 12 (Bookworm) y Debian 13 (Trixie).'
         },
         {
-            id: 'step-2-node',
-            number: '03',
+            id: 'step-4-node',
+            number: '05',
             category: 'node',
             title: 'Instalar Node.js 22 LTS (Repositorio NodeSource "nodistro" para Debian y Kali)',
             description: 'Usa la rama "nodistro" firmada por GPG para que APT en Kali Rolling y Debian instale Node.js 22 LTS sin errores de codename.',
@@ -136,39 +226,32 @@ sudo npm install -g npm@latest tsx pm2`,
             notes: 'Al usar "nodistro", Kali Linux no falla al comprobar la versión de la distribución.'
         },
         {
-            id: 'step-3-permissions',
-            number: '04',
-            category: 'base',
-            title: 'Permisos de Hardware y Grupos de Kali / Debian',
-            description: `Otorga al usuario "${sysUser}" acceso directo a cámara, micrófono, interfaces de red, captura de paquetes y telemetría (/proc).`,
-            command: `for grp in audio video plugdev netdev adm dialout wireshark kaboxer; do
-  getent group "$grp" >/dev/null && sudo usermod -aG "$grp" ${sysUser}
-done`,
-            verifyCommand: `groups ${sysUser}`,
-            notes: 'Detecta automáticamente grupos específicos de Kali Linux (wireshark, kaboxer) y de Debian.'
-        },
-        {
-            id: 'step-4-cli',
-            number: '05',
+            id: 'step-5-cli',
+            number: '06',
             category: 'nexus',
             title: 'Comandos del Paquete Instalado (CLI /usr/bin/nexus)',
-            description: 'Una vez instalado el paquete nexus-ai, tienes el comando global "nexus" disponible desde cualquier terminal de Debian o Kali Linux.',
-            command: `# 1. Configurar tu clave de API de Gemini y reiniciar el demonio automáticamente:
+            description: 'Una vez instalado el paquete nexus-ai, dispones del comando global "nexus" desde cualquier terminal de Debian o Kali Linux.',
+            command: `# 1. Actualizar Nexus a la última versión conservando datos y .env:
+nexus update
+
+# 2. Configurar tu clave de API de Gemini en caliente (sin recompilar):
 nexus apikey "TU_CLAVE_GEMINI_AQUI"
 
-# 2. Abrir la interfaz de Nexus en modo App nativa (con permisos de micro y cámara):
-nexus
+# 3. Crear backup o restaurar versión previa (Rollback):
+nexus backup
+nexus rollback
 
-# 3. Ver estado del servicio systemd o seguir los logs en vivo:
-nexus status
-nexus logs`,
+# 4. Abrir Nexus en modo App o ver estado/versión:
+nexus
+nexus version
+nexus status`,
             verifyCommand: 'which nexus && systemctl is-active nexus.service',
             notes: 'Para desinstalar el paquete en cualquier momento: sudo apt remove nexus-ai'
         },
         {
-            id: 'step-5-ollama',
-            number: '06',
-            category: ' local_ai',
+            id: 'step-6-ollama',
+            number: '07',
+            category: 'local_ai',
             title: 'Motor de IA Local Offline (Ollama en Debian / Kali Linux)',
             description: 'Opcional: Instala Ollama con soporte CORS para que Nexus conmute automáticamente a modelos locales si trabajas sin conexión.',
             command: `curl -fsSL https://ollama.com/install.sh | sh
@@ -183,7 +266,7 @@ ollama pull llama3.2`,
             verifyCommand: 'curl http://localhost:11434/api/tags',
             notes: 'Compatible con aceleración GPU en Debian y Kali Linux.'
         }
-    ], [runDownloadedOneLiner, sysUser]);
+    ], [runDownloadedOneLiner, runDownloadedUpdaterOneLiner, updaterData?.payloadSha256]);
 
     const filteredSteps = useMemo(() => {
         return steps.filter(step => {
@@ -215,19 +298,24 @@ ollama pull llama3.2`,
             <header className="flex flex-wrap items-center justify-between gap-4 px-6 py-4 bg-slate-900/90 border-b border-slate-800 shrink-0">
                 <div className="flex items-center gap-3">
                     <Package className="w-5 h-5 text-rose-500 shrink-0" />
-                    <h2 className="text-base font-semibold tracking-tight text-white whitespace-nowrap">
-                        Instalador de Paquete (.deb) para Debian y Kali Linux
-                    </h2>
+                    <div>
+                        <h2 className="text-base font-semibold tracking-tight text-white whitespace-nowrap">
+                            Instalador y Actualizador Atómico para Debian / Kali Linux
+                        </h2>
+                        <p className="text-[11px] text-slate-400 font-mono">
+                            v{versionInfo?.version || updaterData?.version || '1.2.0'} · Bóveda de Datos Protegida ({versionInfo?.memoriesCount ?? 0} memorias sincronizadas)
+                        </p>
+                    </div>
                 </div>
 
                 {/* Category Filter Buttons */}
                 <nav className="flex items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-lg overflow-x-auto">
                     {[
                         { id: 'all', label: 'Todo' },
-                        { id: 'deb_package', label: 'Paquete .deb (1 Comando)' },
-                        { id: 'base', label: 'Dependencias Kali/Debian' },
-                        { id: 'node', label: 'Node.js 22' },
-                        { id: 'nexus', label: 'CLI Nexus' },
+                        { id: 'update', label: 'Actualizar sin Reinstalar' },
+                        { id: 'deb_package', label: 'Primera Instalación (.deb)' },
+                        { id: 'nexus', label: 'CLI & Rollback' },
+                        { id: 'base', label: 'Dependencias' },
                         { id: 'local_ai', label: 'IA Local' },
                     ].map(tab => (
                         <button
@@ -247,24 +335,24 @@ ollama pull llama3.2`,
                 {/* Primary Actions */}
                 <div className="flex items-center gap-2 shrink-0">
                     <button
-                        onClick={handleDownloadSelfContainedInstaller}
-                        disabled={loadingPayload || !payloadData}
-                        className="px-3.5 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap"
-                        title="Descarga el instalador auto-contenido con el código fuente embebido en Base64"
+                        onClick={handleDownloadAtomicUpdater}
+                        disabled={loadingPayload || !updaterData}
+                        className="px-3.5 py-2 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                        title="Descarga el actualizador atómico que conserva tus datos y .env sin reinstalar"
                     >
                         {loadingPayload ? (
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : downloadedInstaller ? (
+                        ) : downloadedUpdater ? (
                             <Check className="w-3.5 h-3.5" />
                         ) : (
-                            <Download className="w-3.5 h-3.5" />
+                            <RefreshCw className="w-3.5 h-3.5" />
                         )}
                         <span>
                             {loadingPayload
                                 ? 'Empaquetando...'
-                                : downloadedInstaller
-                                ? 'nexus-installer.sh descargado'
-                                : `Descargar nexus-installer.sh (${payloadData?.sizeKB || 128} KB)`}
+                                : downloadedUpdater
+                                ? 'nexus-updater.sh descargado'
+                                : `Descargar Actualizador (${updaterData?.sizeKB || 138} KB)`}
                         </span>
                     </button>
                     <button
@@ -285,7 +373,7 @@ ollama pull llama3.2`,
                         type="text"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder="Filtrar comando (ej: dpkg, kali, node, systemd)..."
+                        placeholder="Filtrar comando (ej: update, rollback, backup, dpkg, kali)..."
                         className="w-full pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-rose-500/60"
                     />
                 </div>
@@ -337,76 +425,94 @@ ollama pull llama3.2`,
 
             {/* Main Content */}
             <div className="flex-1 overflow-y-auto p-6 space-y-5 custom-scrollbar">
-                {/* HERO FOCAL ANCHOR: Proxy-Proof Self-Contained .deb Installer */}
-                <div className="p-5 rounded-xl bg-slate-900/90 border border-rose-500/40 space-y-4">
+                {/* HERO 1: ATOMIC ZERO-REINSTALL UPDATER (Preserves .env + Data Vault + Rollback) */}
+                <div className="p-5 rounded-xl bg-slate-900/90 border border-emerald-500/40 space-y-4">
                     <div className="flex flex-wrap items-start justify-between gap-4">
                         <div className="space-y-1.5">
-                            <div className="flex items-center gap-2 text-xs text-rose-400 font-semibold">
-                                <Terminal className="w-4 h-4" />
-                                <span>Instalación en Paquete (.deb) Todo-en-Uno — Sin error &quot;&lt;!doctype html&gt;&quot; (Código Fuente Embebido)</span>
+                            <div className="flex items-center gap-2 text-xs text-emerald-400 font-semibold">
+                                <ShieldCheck className="w-4 h-4" />
+                                <span>Actualización Atómica Segura (Sin Reinstalación Completa · 100% Integridad de Datos y .env)</span>
                             </div>
-                            <p className="text-xs text-slate-300 leading-relaxed max-w-3xl">
-                                Las URLs de previsualización de Cloud Run (<code className="text-slate-400">ais-dev-*.run.app</code>) bloquean <code className="text-slate-400">curl</code> externo devolviendo HTML (<code className="text-rose-300">&lt;!doctype html&gt;</code>) porque requieren la cookie de tu navegador. Para solucionarlo al 100%, este panel empaqueta <strong>todo el código fuente de Nexus en Base64 dentro del instalador</strong>. Elige cualquiera de estas 2 formas directas:
+                            <p className="text-xs text-slate-300 leading-relaxed max-w-4xl">
+                                Actualiza tu Nexus ya instalado en <code className="text-slate-200 font-mono">/opt/nexus</code> en <strong>~10 segundos</strong> sin reinstalar paquetes APT ni perder tu <code className="text-emerald-300 font-mono">GEMINI_API_KEY</code> (<code className="text-slate-300 font-mono">/opt/nexus/.env</code>) ni tus memorias y notas (<code className="text-emerald-300 font-mono">/opt/nexus/data/nexus-vault.json</code>). Incluye <strong>verificación SHA-256</strong>, <strong>snapshot automático en /var/backups/nexus</strong>, compilación aislada con hardlinks (<code className="text-slate-300 font-mono">cp -al node_modules</code>) y <strong>Rollback Automático</strong> si falla el health-check.
                             </p>
                         </div>
                     </div>
 
-                    {/* Option A: 1-Click Download + 1 Short Command */}
                     <div className="p-4 rounded-lg bg-slate-950/90 border border-slate-800 space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <span className="text-xs font-semibold text-white">
-                                Opción A (Más limpia): 1. Descarga el auto-instalador y 2. Ejecuta este comando en tu terminal
+                                Actualizar Nexus instalado: 1. Descarga nexus-updater.sh y 2. Ejecuta este comando (o &quot;nexus update&quot;)
                             </span>
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
                                 <button
-                                    onClick={handleDownloadSelfContainedInstaller}
-                                    disabled={loadingPayload || !payloadData}
-                                    className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                                    onClick={handleDownloadAtomicUpdater}
+                                    disabled={loadingPayload || !updaterData}
+                                    className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
                                 >
                                     <Download className="w-3.5 h-3.5" />
-                                    <span>1. Descargar nexus-installer.sh</span>
+                                    <span>1. Descargar nexus-updater.sh</span>
                                 </button>
                                 <button
-                                    onClick={handleCopyShortOneLiner}
-                                    className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                                    onClick={handleCopyUpdateShortOneLiner}
+                                    className="px-3.5 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
                                 >
-                                    {copiedShortCmd ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                                    <span>{copiedShortCmd ? '¡Copiado!' : '2. Copiar Comando'}</span>
+                                    {copiedUpdateShortCmd ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                                    <span>{copiedUpdateShortCmd ? '¡Comando Copiado!' : '2. Copiar Comando de Actualización'}</span>
+                                </button>
+                                <button
+                                    onClick={handleCopyUpdateFullPayload}
+                                    disabled={loadingPayload || !updaterData}
+                                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 border border-slate-700 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                                >
+                                    {copiedUpdateFullPayload ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <FileCode className="w-3.5 h-3.5 text-sky-400" />}
+                                    <span>{copiedUpdateFullPayload ? '¡Auto-Actualizador Copiado!' : 'Copiar Auto-Actualizador sin Descargar'}</span>
                                 </button>
                             </div>
                         </div>
                         <div className="bg-slate-900 border border-slate-800 rounded-md p-3 font-mono text-xs text-emerald-400 overflow-x-auto select-all">
-                            <code className="whitespace-nowrap">{runDownloadedOneLiner}</code>
+                            <code className="whitespace-nowrap">{runDownloadedUpdaterOneLiner}</code>
                         </div>
                     </div>
+                </div>
 
-                    {/* Option B: Copy & Paste Self-Contained Command directly without downloading any file */}
-                    <div className="pt-2 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                        <div className="space-y-0.5">
-                            <span className="text-slate-200 font-medium block">
-                                Opción B (Sin descargar archivos): Copiar y pegar el comando auto-contenido directamente en la terminal
-                            </span>
-                            <span className="text-slate-400 block">
-                                Copia el script completo con el código fuente de Nexus incrustado en Base64 ({payloadData?.sizeKB || 128} KB), construye <code className="font-mono text-sky-300">nexus-ai_1.0.0.deb</code> y lo instala con <code className="font-mono text-sky-300">dpkg -i</code>.
-                            </span>
+                {/* HERO 2: INITIAL .DEB PACKAGE INSTALLER */}
+                <div className="p-5 rounded-xl bg-slate-900/70 border border-slate-800 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="space-y-1">
+                            <div className="flex items-center gap-2 text-xs text-rose-400 font-semibold">
+                                <Terminal className="w-4 h-4" />
+                                <span>Primera Instalación Completa de Paquete (.deb) — Solo si aún no has instalado Nexus</span>
+                            </div>
+                            <p className="text-xs text-slate-400">
+                                Instala dependencias APT de Debian/Kali, Node.js 22 LTS, construye <code className="text-slate-300 font-mono">nexus-ai_1.0.0.deb</code> y registra el demonio <code className="text-slate-300 font-mono">systemd</code>.
+                            </p>
                         </div>
-                        <button
-                            onClick={handleCopyFullEmbeddedCommand}
-                            disabled={loadingPayload || !payloadData}
-                            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white border border-slate-700 rounded-lg text-xs font-semibold transition-colors flex items-center gap-2 self-start sm:self-auto shrink-0 whitespace-nowrap"
-                        >
-                            {copiedFullPayload ? (
-                                <>
-                                    <Check className="w-4 h-4 text-emerald-400" />
-                                    <span className="text-emerald-400">¡Comando Auto-Contenido Copiado! Pégalo en tu terminal</span>
-                                </>
-                            ) : (
-                                <>
-                                    <FileCode className="w-4 h-4 text-sky-400" />
-                                    <span>Copiar Comando Auto-Contenido Completo ({payloadData?.sizeKB || 128} KB)</span>
-                                </>
-                            )}
-                        </button>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <button
+                                onClick={handleDownloadSelfContainedInstaller}
+                                disabled={loadingPayload || !payloadData}
+                                className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>{downloadedInstaller ? 'nexus-installer.sh descargado' : '1. Descargar nexus-installer.sh'}</span>
+                            </button>
+                            <button
+                                onClick={handleCopyShortOneLiner}
+                                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                                {copiedShortCmd ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                                <span>{copiedShortCmd ? '¡Copiado!' : '2. Copiar Comando Instalador'}</span>
+                            </button>
+                            <button
+                                onClick={handleCopyFullEmbeddedCommand}
+                                disabled={loadingPayload || !payloadData}
+                                className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                                {copiedFullPayload ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <FileCode className="w-3.5 h-3.5 text-slate-400" />}
+                                <span>{copiedFullPayload ? '¡Copiado!' : 'Copiar Instalador Completo'}</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -499,14 +605,14 @@ ollama pull llama3.2`,
             {/* Quiet Footer */}
             <footer className="px-6 py-3 bg-slate-900 border-t border-slate-800 text-xs text-slate-400 flex flex-wrap items-center justify-between gap-4 shrink-0">
                 <div className="flex items-center gap-2">
-                    <span>Paquete DPKG/APT: nexus-ai (1.0.0)</span>
+                    <span>Nexus v{versionInfo?.version || '1.2.0'}</span>
                     <span aria-hidden="true">·</span>
-                    <span>Debian 12/13 · Kali Linux Rolling</span>
+                    <span>Actualizador Delta Atómico + Rollback SHA-256</span>
                     <span aria-hidden="true">·</span>
-                    <span>Código Fuente Embebido en Base64</span>
+                    <span>Bóveda: /opt/nexus/data/nexus-vault.json</span>
                 </div>
                 <div className="flex items-center gap-3">
-                    <span className="text-slate-500">Para cerrar por voz: "Nexus, cierra el panel de Debian"</span>
+                    <span className="text-slate-500">Para cerrar por voz: &quot;Nexus, cierra el panel de Debian&quot;</span>
                     <button
                         onClick={onClose}
                         className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-xs font-medium transition-colors"

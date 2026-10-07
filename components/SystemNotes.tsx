@@ -21,6 +21,11 @@ export const SystemNotes: React.FC<SystemNotesProps> = ({ onClose, initialConten
 
     const handleSave = () => {
         localStorage.setItem('nexus_system_notes', content);
+        fetch('/api/data-vault/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ notes: content }),
+        }).catch(() => {});
         setSaved(true);
         setTimeout(() => setSaved(false), 2000);
     };

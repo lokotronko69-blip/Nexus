@@ -94,6 +94,8 @@ export const SystemTerminal: React.FC<SystemTerminalProps> = ({ onClose, onExecu
   say <texto>       - Ordena a Nexus pronunciar el texto en voz alta
   voice [nombre]    - Muestra o cambia la voz (SOLO Koko puede cambiarla; por defecto: Kore)
   apikey <clave>    - Actualiza en caliente GEMINI_API_KEY en /opt/nexus/.env y reconecta
+  version / vault   - Muestra versión activa, bóveda de datos y hash SHA-256
+  update            - Sincroniza bóveda de datos y abre el actualizador atómico delta
   debian            - Abre el panel con todos los comandos para instalar Nexus en Debian
   exit / close      - Cierra la terminal`;
                 break;
@@ -243,12 +245,32 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                 break;
             }
 
+            case 'version':
+            case 'vault': {
+                try {
+                    const r = await fetch('/api/version', { cache: 'no-store' });
+                    const v = await r.json();
+                    outputText = `ESTADO DE VERSIÓN Y BÓVEDA DE DATOS DE NEXUS:
+  Versión del Núcleo:   v${v.version || '1.2.0'}
+  Ruta de la Bóveda:    ${v.vaultPath || '/opt/nexus/data/nexus-vault.json'}
+  Integridad SHA-256:   ${v.vaultChecksum || 'verificado'}
+  Memorias Protegidas:  ${v.memoriesCount ?? 0} registros
+  Snapshots en Disco:   ${v.backupsCount ?? 0} en /var/backups/nexus`;
+                    outputType = 'system';
+                } catch {
+                    outputText = 'Nexus v1.2.0 - Bóveda de datos local activa.';
+                    outputType = 'system';
+                }
+                break;
+            }
+
+            case 'update':
             case 'debian':
             case 'install-debian':
                 if ((window as any).nexus?.showDebianInstall) {
                     outputText = (window as any).nexus.showDebianInstall();
                 } else {
-                    outputText = 'Abriendo panel de instalación de Nexus para Debian Linux...';
+                    outputText = 'Abriendo panel de instalación y actualización atómica de Nexus para Debian / Kali Linux...';
                 }
                 break;
 

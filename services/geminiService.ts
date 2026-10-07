@@ -60,11 +60,67 @@ async function getDB() {
                     console.log("Migrated memories from localStorage to IndexedDB");
                 }
             }
+
+            // Hydrate and sync with server-side persistent Data Vault (/opt/nexus/data/nexus-vault.json)
+            fetch('/api/data-vault', { cache: 'no-store' })
+                .then(r => (r.ok ? r.json() : null))
+                .then(async (vault) => {
+                    if (!vault) return;
+                    const existing = await db.getAll('memories');
+                    const seenFacts = new Set(existing.map(m => (m.fact || '').toLowerCase().trim()));
+                    let importedCount = 0;
+                    if (Array.isArray(vault.memories)) {
+                        const tx = db.transaction('memories', 'readwrite');
+                        for (const vm of vault.memories) {
+                            if (vm && vm.fact && !seenFacts.has(vm.fact.toLowerCase().trim())) {
+                                seenFacts.add(vm.fact.toLowerCase().trim());
+                                await tx.store.add({
+                                    fact: vm.fact,
+                                    timestamp: vm.timestamp || new Date().toLocaleString('es-ES'),
+                                    category: vm.category,
+                                });
+                                importedCount++;
+                            }
+                        }
+                        await tx.done;
+                    }
+                    if (vault.notes && !localStorage.getItem('nexus_system_notes')) {
+                        localStorage.setItem('nexus_system_notes', vault.notes);
+                    }
+                    if (importedCount > 0) {
+                        console.log(`Restored ${importedCount} memories from Nexus Data Vault`);
+                    }
+                    // Push merged state back to disk vault
+                    syncVaultWithServer().catch(() => {});
+                })
+                .catch(() => {});
         } catch (e) {
             console.error("Error migrating memories:", e);
         }
     }
     return dbPromise;
+}
+
+export async function syncVaultWithServer(options?: { replaceMemories?: boolean; clearMemories?: boolean }): Promise<any> {
+    try {
+        const db = await getDB();
+        const memories = await db.getAllFromIndex('memories', 'by-timestamp');
+        const transcripts = await db.getAllFromIndex('transcripts', 'by-timestamp');
+        const notes = localStorage.getItem('nexus_system_notes') || '';
+        const res = await fetch('/api/data-vault/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                memories: memories.filter(m => m && m.fact),
+                transcripts: transcripts.slice(-80),
+                notes,
+                replaceMemories: options?.replaceMemories,
+                clearMemories: options?.clearMemories,
+            }),
+        });
+        if (res.ok) return await res.json();
+    } catch {}
+    return null;
 }
 
 export interface Memory {
@@ -83,6 +139,7 @@ export async function saveTranscript(text: string, role: 'user' | 'model'): Prom
             role,
             timestamp: Date.now()
         });
+        syncVaultWithServer().catch(() => {});
     } catch (e) {
         console.error("Error saving transcript:", e);
     }
@@ -150,6 +207,7 @@ export async function saveMemoryToStorage(fact: string, category?: string): Prom
         };
 
         await db.add('memories', newMemory);
+        syncVaultWithServer().catch(() => {});
         return "Memoria guardada correctamente en almacenamiento ilimitado.";
     } catch (e) {
         console.error("Error saving memory:", e);
@@ -204,6 +262,7 @@ export async function deleteMemory(id: number): Promise<boolean> {
     try {
         const db = await getDB();
         await db.delete('memories', id);
+        syncVaultWithServer({ replaceMemories: true }).catch(() => {});
         return true;
     } catch (e) {
         console.error("Error deleting memory", e);
@@ -240,6 +299,7 @@ export async function clearAllMemories(): Promise<boolean> {
     try {
         const db = await getDB();
         await db.clear('memories');
+        syncVaultWithServer({ clearMemories: true }).catch(() => {});
         return true;
     } catch (e) {
         console.error("Error clearing memories", e);
