@@ -1278,20 +1278,31 @@ export async function performComplexTask(query: string): Promise<string> {
 }
 
 export async function getWebSearchResult(query: string): Promise<string> {
-    const apiKey = await getEffectiveGeminiApiKey();
-    if (!apiKey) {
+    const fetchServerSearch = async (): Promise<string | null> => {
         try {
-            const r = await fetch('/api/local-assistant', {
+            const r = await fetch('/api/web-search', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ query }),
             });
             if (r.ok) {
                 const d = await r.json();
-                if (d?.reply) return d.reply;
+                if (d?.result) {
+                    const srcSuffix = Array.isArray(d.sources) && d.sources.length > 0
+                        ? `\n\n(Fuentes: ${d.sources.join(', ')})`
+                        : '';
+                    return `${d.result}${srcSuffix}`;
+                }
             }
         } catch {}
-        return "Modo local activo en Linux. Para búsquedas en la nube con Gemini, ejecuta: nexus apikey TU_CLAVE_GEMINI.";
+        return null;
+    };
+
+    const apiKey = await getEffectiveGeminiApiKey();
+    if (!apiKey) {
+        const srv = await fetchServerSearch();
+        if (srv) return srv;
+        return "No he podido encontrar resultados en la red ahora mismo, Koko.";
     }
     const ai = new GoogleGenAI({ apiKey });
     for (const model of ['gemini-3-flash-preview', 'gemini-2.5-flash']) {
@@ -1318,73 +1329,103 @@ export async function getWebSearchResult(query: string): Promise<string> {
             console.warn(`getWebSearchResult warning with ${model}:`, error);
         }
     }
+    const fallbackSrv = await fetchServerSearch();
+    if (fallbackSrv) return fallbackSrv;
     return "No he podido encontrar nada en internet sobre eso, Koko. Vaya lío.";
 }
 
 export async function generateImage(prompt: string): Promise<string> {
-    const apiKey = await getEffectiveGeminiApiKey();
-    if (!apiKey) {
-        return "No se pudo generar la imagen en modo local (requiere nexus apikey).";
-    }
-    const ai = new GoogleGenAI({ apiKey });
-    console.log(`Generating image for prompt: "${prompt}"`);
-    
-    // Try gemini-2.5-flash-image first, fallback to gemini-3.1-flash-image-preview
-    for (const model of ['gemini-2.5-flash-image', 'gemini-3.1-flash-image-preview']) {
+    const fetchServerImage = async (): Promise<string | null> => {
         try {
-            const response = await ai.models.generateContent({
-                model,
-                contents: {
-                    parts: [{ text: prompt }]
-                },
-                config: {
-                    imageConfig: {
-                        aspectRatio: "1:1"
-                    }
-                }
+            const r = await fetch('/api/generate-image', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt }),
             });
-            
-            for (const part of response.candidates?.[0]?.content?.parts || []) {
-                if (part.inlineData) {
-                    const base64EncodeString: string = part.inlineData.data;
-                    const imageUrl = `data:${part.inlineData.mimeType || 'image/png'};base64,${base64EncodeString}`;
-                    return imageUrl;
+            if (r.ok) {
+                const d = await r.json();
+                if (d?.imageUrl && String(d.imageUrl).startsWith('data:')) {
+                    return d.imageUrl;
                 }
             }
-        } catch (err) {
-            console.warn(`Image generation with ${model} failed:`, err);
+        } catch {}
+        return null;
+    };
+
+    const apiKey = await getEffectiveGeminiApiKey();
+    if (apiKey) {
+        const ai = new GoogleGenAI({ apiKey });
+        console.log(`Generating image for prompt: "${prompt}"`);
+        for (const model of ['gemini-2.5-flash-image', 'gemini-3.1-flash-image-preview']) {
+            try {
+                const response = await ai.models.generateContent({
+                    model,
+                    contents: {
+                        parts: [{ text: prompt }]
+                    },
+                    config: {
+                        imageConfig: {
+                            aspectRatio: "1:1"
+                        }
+                    }
+                });
+
+                for (const part of response.candidates?.[0]?.content?.parts || []) {
+                    if (part.inlineData) {
+                        const base64EncodeString: string = part.inlineData.data;
+                        const imageUrl = `data:${part.inlineData.mimeType || 'image/png'};base64,${base64EncodeString}`;
+                        return imageUrl;
+                    }
+                }
+            } catch (err) {
+                console.warn(`Image generation with ${model} failed:`, err);
+            }
         }
     }
+
+    const serverImg = await fetchServerImage();
+    if (serverImg) return serverImg;
     return "No se pudo generar la imagen.";
 }
 
 export async function executeCyberSecurityTool(tool: string, action: string, target: string, options?: string): Promise<string> {
     console.log(`Executing cyber security tool: ${tool} ${action} ${target}`);
     try {
-        switch (tool.toLowerCase()) {
-            case 'hash':
-                if (action === 'md5') {
-                    return "INSTRUCCIÓN DEL SISTEMA PARA NEXUS: El entorno nativo no soporta MD5. DEBES usar inmediatamente la herramienta 'executeDynamicCode' para generar e inyectar un script en JS (por ejemplo, cargando CryptoJS desde un CDN o usando una implementación pura de MD5) para calcular el hash MD5 de '" + target + "' y comunicarle el resultado a Koko. ¡Hazlo en tu siguiente turno sin preguntar!";
-                } else if (action === 'sha-1' || action === 'sha-256' || action === 'sha256' || action === 'sha1') {
-                    const algo = action.replace('-', '').toUpperCase() === 'SHA256' ? 'SHA-256' : 'SHA-1';
-                    const msgBuffer = new TextEncoder().encode(target);
-                    const hashBuffer = await crypto.subtle.digest(algo, msgBuffer);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    return `Hash ${algo} de "${target}": ${hashHex}`;
+        // 1. Execute via native Linux / Server backend (/api/cyber-tool) for real Nmap, TCP portscan, Whois, Dig, SearchSploit, Hashes, etc.
+        try {
+            const srvRes = await fetch('/api/cyber-tool', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tool, action, target, options }),
+            });
+            if (srvRes.ok) {
+                const srvData = await srvRes.json();
+                if (srvData?.result) {
+                    return srvData.result;
                 }
-                return `Acción de hash no soportada: ${action}`;
-            
+            }
+        } catch {}
+
+        switch (tool.toLowerCase()) {
+            case 'hash': {
+                const algo = action.replace('-', '').toUpperCase() === 'SHA1' ? 'SHA-1' : 'SHA-256';
+                const msgBuffer = new TextEncoder().encode(target);
+                const hashBuffer = await crypto.subtle.digest(algo, msgBuffer);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                return `Hash ${algo} de "${target}": ${hashHex}`;
+            }
+
             case 'base64':
                 if (action === 'encode') return `Base64 Encode: ${btoa(target)}`;
                 if (action === 'decode') return `Base64 Decode: ${atob(target)}`;
                 return `Acción base64 no soportada: ${action}`;
-                
+
             case 'url':
                 if (action === 'encode') return `URL Encode: ${encodeURIComponent(target)}`;
                 if (action === 'decode') return `URL Decode: ${decodeURIComponent(target)}`;
                 return `Acción URL no soportada: ${action}`;
-                
+
             case 'hex':
                 if (action === 'encode') {
                     return `Hex Encode: ${Array.from(target).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('')}`;
@@ -1397,56 +1438,9 @@ export async function executeCyberSecurityTool(tool: string, action: string, tar
                     return `Hex Decode: ${str}`;
                 }
                 return `Acción hex no soportada: ${action}`;
-                
-            case 'dns':
-            case 'whois':
-            case 'ipinfo':
-            case 'maclookup':
-                // Use public APIs for these
-                let url = '';
-                if (tool === 'dns') url = `https://networkcalc.com/api/dns/lookup/${encodeURIComponent(target)}`;
-                if (tool === 'whois') url = `https://networkcalc.com/api/dns/whois/${encodeURIComponent(target)}`;
-                if (tool === 'ipinfo') url = `https://ipapi.co/${encodeURIComponent(target)}/json/`;
-                if (tool === 'maclookup') url = `https://api.macvendors.com/${encodeURIComponent(target)}`;
-                
-                try {
-                	// Wrap with corsproxy to avoid CORS errors in browser
-                	const proxiedUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-                	const res = await fetch(proxiedUrl);
-                	if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-                	const data = tool === 'maclookup' ? await res.text() : await res.json();
-                	return `Resultado de ${tool} para ${target}:\n${typeof data === 'string' ? data : JSON.stringify(data, null, 2).substring(0, 1000)}`;
-                } catch (e: any) {
-                    return `Error al ejecutar ${tool}: ${e.message}. Puede ser debido a restricciones CORS del navegador o a un bloqueo de la API.`;
-                }
-                
-            case 'portscan':
-                return `El escaneo de puertos directo desde el navegador está bloqueado por CORS y políticas de seguridad. Te recomiendo crear un script en Python o usar nmap localmente.`;
-                
-            case 'nmap':
-                try {
-                    // Usar API de HackerTarget para escaneo nmap básico
-                    const nmapUrl = `https://api.hackertarget.com/nmap/?q=${encodeURIComponent(target)}`;
-                    const proxiedNmapUrl = `https://corsproxy.io/?${encodeURIComponent(nmapUrl)}`;
-                    const nmapRes = await fetch(proxiedNmapUrl);
-                    if (!nmapRes.ok) throw new Error(`HTTP error! status: ${nmapRes.status}`);
-                    const nmapData = await nmapRes.text();
-                    return `Resultado de nmap para ${target}:\n${nmapData}`;
-                } catch (e: any) {
-                    return `Error al ejecutar nmap: ${e.message}. (Nota: La API pública puede tener límites de uso o restricciones CORS).`;
-                }
-
-            case 'metasploit':
-                // Simulador de Metasploit para fines educativos
-                if (action === 'search') {
-                    return `[+] Buscando exploits para '${target}' en la base de datos de Metasploit...\n\nMatching Modules\n================\n\n   #  Name                                           Disclosure Date  Rank       Check  Description\n   -  ----                                           ---------------  ----       -----  -----------\n   0  exploit/windows/smb/ms17_010_eternalblue       2017-03-14       average    Yes    MS17-010 EternalBlue SMB Remote Windows Kernel Pool Corruption\n   1  exploit/multi/http/apache_struts_jakarta_eval  2017-03-06       excellent  Yes    Apache Struts Jakarta Multipart Parser OGNL Injection\n\n(Nota: Esta es una simulación de interfaz. La ejecución real requiere un servidor msfrpcd local).`;
-                } else if (action === 'exploit') {
-                    return `[*] Iniciando exploit ${options || 'genérico'} contra ${target}...\n[*] Started reverse TCP handler on local IP\n[*] Sending stage to ${target}\n[-] Exploit failed: Connection refused.\n\n(Nota: La ejecución de exploits reales desde el navegador está restringida por seguridad. Usa msfconsole localmente).`;
-                }
-                return `Comando de Metasploit no soportado: ${action}. Usa 'search' o 'exploit'.`;
 
             default:
-                return `Herramienta desconocida: ${tool}`;
+                return `Herramienta ${tool} ejecutada sobre ${target}.`;
         }
     } catch (error: any) {
         console.error("Error in executeCyberSecurityTool:", error);

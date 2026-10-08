@@ -68,23 +68,38 @@ export const DebianInstallPanel: React.FC<DebianInstallPanelProps> = ({ onClose 
     useEffect(() => {
         let active = true;
         setLoadingPayload(true);
-        syncVaultWithServer().catch(() => {});
 
-        Promise.all([
-            fetch(`/api/installer-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
-            fetch(`/api/updater-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
-            fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
-        ])
-            .then(([instData, updData, verData]) => {
+        const prepareAndLoad = async () => {
+            await syncVaultWithServer().catch(() => {});
+            try {
+                const storedKey = localStorage.getItem('nexus_gemini_api_key');
+                if (storedKey && storedKey.trim()) {
+                    await fetch('/api/runtime-config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ apiKey: storedKey.trim() }),
+                    });
+                }
+            } catch {}
+
+            try {
+                const [instData, updData, verData] = await Promise.all([
+                    fetch(`/api/installer-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
+                    fetch(`/api/updater-payload?user=${encodeURIComponent(sysUser)}&port=${encodeURIComponent(port)}&t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()),
+                    fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+                ]);
                 if (!active) return;
                 if (instData?.selfExtractingScript) setPayloadData(instData);
                 if (updData?.updaterScript) setUpdaterData(updData);
                 if (verData) setVersionInfo(verData);
-            })
-            .catch(err => console.error('Error loading installer/updater payloads:', err))
-            .finally(() => {
+            } catch (err) {
+                console.error('Error loading installer/updater payloads:', err);
+            } finally {
                 if (active) setLoadingPayload(false);
-            });
+            }
+        };
+
+        prepareAndLoad();
         return () => { active = false; };
     }, [sysUser, port]);
 

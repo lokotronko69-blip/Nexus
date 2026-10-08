@@ -1,6 +1,8 @@
 import express from 'express';
 import { Server } from 'socket.io';
 import http from 'http';
+import net from 'net';
+import dns from 'dns';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -9,7 +11,7 @@ import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.2.3';
+const NEXUS_VERSION = '1.3.0';
 
 interface NexusVaultData {
   version: string;
@@ -569,9 +571,15 @@ function getResolvedGeminiApiKey(forExternalInstaller = false): string {
     } catch {}
   }
 
-  const envKey = process.env.GEMINI_API_KEY;
-  if (envKey && !isPlaceholderOrProxyKey(envKey, forExternalInstaller)) {
-    return envKey.trim().replace(/^["']|["']$/g, '');
+  const envCandidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.API_KEY,
+    process.env.VITE_GEMINI_API_KEY,
+  ];
+  for (const envKey of envCandidates) {
+    if (envKey && !isPlaceholderOrProxyKey(envKey, forExternalInstaller)) {
+      return envKey.trim().replace(/^["']|["']$/g, '');
+    }
   }
   return '';
 }
@@ -847,7 +855,622 @@ async function startServer() {
     });
   });
 
-  function buildLocalAssistantReply(queryRaw: string): string {
+  async function performLocalWebSearch(queryRaw: string): Promise<{ result: string; sources: string[] }> {
+    const query = String(queryRaw || '').trim();
+    if (!query) return { result: 'Consulta vacía.', sources: [] };
+
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey) {
+      for (const modelName of ['gemini-2.5-flash', 'gemini-3-flash-preview']) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: serverApiKey });
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: query,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          });
+          const text = (response.text || '').trim();
+          const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          const sources = chunks
+            .map((c: any) => c.web?.uri || c.web?.title)
+            .filter(Boolean);
+          if (text) {
+            return { result: text, sources };
+          }
+        } catch {}
+      }
+    }
+
+    const cleanQuery = query
+      .replace(/^(busca en internet|busca en la web|busca|investiga sobre|investiga|qu[eé] es|qui[eé]n es|qui[eé]n fue|cu[aá]l es|dime qu[eé] es|expl[ií]came qu[eé] es)\s+/i, '')
+      .replace(/[¿?¡!]/g, '')
+      .trim() || query;
+
+    const sources: string[] = [];
+    const snippets: string[] = [];
+
+    // 1. DuckDuckGo Instant Answer API
+    try {
+      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(cleanQuery)}&format=json&no_html=1&skip_disambig=1`;
+      const ddgRes = await fetch(ddgUrl, {
+        headers: { 'User-Agent': 'NexusOS/1.3 (Linux x86_64)' },
+        signal: AbortSignal.timeout(3500),
+      });
+      if (ddgRes.ok) {
+        const ddgData: any = await ddgRes.json();
+        if (ddgData.AbstractText) {
+          snippets.push(String(ddgData.AbstractText).trim());
+          if (ddgData.AbstractURL) sources.push(String(ddgData.AbstractURL));
+        } else if (ddgData.Answer) {
+          snippets.push(String(ddgData.Answer).trim());
+        }
+        if (Array.isArray(ddgData.RelatedTopics)) {
+          for (const topic of ddgData.RelatedTopics.slice(0, 2)) {
+            if (topic?.Text) snippets.push(String(topic.Text).trim());
+            if (topic?.FirstURL) sources.push(String(topic.FirstURL));
+          }
+        }
+      }
+    } catch {}
+
+    // 2. Wikipedia Search & Extracts (Spanish then English fallback)
+    for (const lang of ['es', 'en']) {
+      if (snippets.length >= 2) break;
+      try {
+        const wikiSearchUrl = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanQuery)}&utf8=&format=json&srlimit=2`;
+        const wRes = await fetch(wikiSearchUrl, {
+          headers: { 'User-Agent': 'NexusOS/1.3 (Linux x86_64)' },
+          signal: AbortSignal.timeout(3500),
+        });
+        if (wRes.ok) {
+          const wData: any = await wRes.json();
+          const hits = wData?.query?.search || [];
+          for (const hit of hits.slice(0, 2)) {
+            const title = hit?.title;
+            if (title) {
+              const sumRes = await fetch(
+                `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`,
+                {
+                  headers: { 'User-Agent': 'NexusOS/1.3 (Linux x86_64)' },
+                  signal: AbortSignal.timeout(3000),
+                }
+              );
+              if (sumRes.ok) {
+                const sumData: any = await sumRes.json();
+                if (sumData?.extract) {
+                  snippets.push(`${sumData.title}: ${sumData.extract}`);
+                  if (sumData?.content_urls?.desktop?.page) {
+                    sources.push(sumData.content_urls.desktop.page);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (snippets.length > 0) {
+      const combined = snippets.slice(0, 2).join('\n\n');
+      return {
+        result: combined,
+        sources: Array.from(new Set(sources)).slice(0, 4),
+      };
+    }
+
+    return {
+      result: `No encontré artículos directos sobre "${cleanQuery}", Koko, pero puedes pedirme que escanee un dominio con whois o dns, o abrir el navegador directamente.`,
+      sources: [],
+    };
+  }
+
+  app.post('/api/web-search', async (req, res) => {
+    const query = String(req.body?.query || '').trim();
+    const data = await performLocalWebSearch(query);
+    res.json(data);
+  });
+
+  app.post('/api/generate-image', async (req, res) => {
+    const prompt = String(req.body?.prompt || '').trim();
+    if (!prompt) {
+      res.status(400).json({ error: 'Prompt vacío' });
+      return;
+    }
+
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey) {
+      for (const modelName of ['gemini-2.5-flash-image', 'gemini-3.1-flash-image-preview']) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: serverApiKey });
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: { parts: [{ text: prompt }] },
+            config: { imageConfig: { aspectRatio: '1:1' } },
+          });
+          for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData?.data) {
+              res.json({
+                imageUrl: `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`,
+                provider: modelName,
+              });
+              return;
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // Fallback 1: Server-side fetch from Pollinations AI (returns base64 data URI so browser displays it without CORS/CSP issues)
+    try {
+      const seed = Math.floor(Math.random() * 100000);
+      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=768&height=768&nologo=true&seed=${seed}`;
+      const imgRes = await fetch(pollUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) NexusOS/1.3' },
+        signal: AbortSignal.timeout(12000),
+      });
+      if (imgRes.ok) {
+        const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+        const buf = Buffer.from(await imgRes.arrayBuffer());
+        if (buf.byteLength > 1024) {
+          res.json({
+            imageUrl: `data:${contentType};base64,${buf.toString('base64')}`,
+            provider: 'pollinations-ai',
+          });
+          return;
+        }
+      }
+    } catch {}
+
+    // Fallback 2: Offline Cyberpunk SVG Synthesis
+    const safeTitle = prompt.slice(0, 56).replace(/[<>&"']/g, '');
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#090d16"/>
+          <stop offset="50%" stop-color="#0f172a"/>
+          <stop offset="100%" stop-color="#1e1b4b"/>
+        </linearGradient>
+        <radialGradient id="glow" cx="50%" cy="45%" r="45%">
+          <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.45"/>
+          <stop offset="60%" stop-color="#a855f7" stop-opacity="0.15"/>
+          <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <rect width="640" height="640" fill="url(#bg)"/>
+      <circle cx="320" cy="290" r="260" fill="url(#glow)"/>
+      <g stroke="#06b6d4" stroke-opacity="0.2" stroke-width="1">
+        <line x1="0" y1="160" x2="640" y2="160"/><line x1="0" y1="320" x2="640" y2="320"/><line x1="0" y1="480" x2="640" y2="480"/>
+        <line x1="160" y1="0" x2="160" y2="640"/><line x1="320" y1="0" x2="320" y2="640"/><line x1="480" y1="0" x2="480" y2="640"/>
+      </g>
+      <polygon points="320,130 460,370 180,370" fill="none" stroke="#22d3ee" stroke-width="3"/>
+      <circle cx="320" cy="290" r="68" fill="none" stroke="#f472b6" stroke-width="2.5" stroke-dasharray="8 6"/>
+      <circle cx="320" cy="290" r="18" fill="#22d3ee"/>
+      <text x="320" y="485" text-anchor="middle" fill="#38bdf8" font-family="monospace" font-size="18" font-weight="bold">NEXUS VISUAL SYNTHESIS</text>
+      <text x="320" y="525" text-anchor="middle" fill="#e2e8f0" font-family="monospace" font-size="14">${safeTitle}</text>
+    </svg>`;
+    res.json({
+      imageUrl: `data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`,
+      provider: 'nexus-svg-engine',
+    });
+  });
+
+  app.post('/api/analyze-vision', async (req, res) => {
+    const imageBase64 = String(req.body?.imageBase64 || '').replace(/^data:image\/\w+;base64,/, '').trim();
+    const prompt = String(req.body?.prompt || 'Describe en español qué ves en esta imagen de forma directa y natural para Koko.').trim();
+    if (!imageBase64) {
+      res.status(400).json({ error: 'No image frame provided' });
+      return;
+    }
+
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey) {
+      for (const modelName of ['gemini-2.5-flash', 'gemini-3-flash-preview']) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: serverApiKey });
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } },
+                  { text: `Eres Nexus, la compañera e ingeniera de Koko. ${prompt}` },
+                ],
+              },
+            ],
+          });
+          const reply = (response.text || '').trim();
+          if (reply) {
+            res.json({ reply });
+            return;
+          }
+        } catch {}
+      }
+    }
+
+    // Offline Linux OCR fallback via tesseract if installed
+    const tmpImg = `/tmp/nexus-vision-${process.pid}-${Date.now()}.jpg`;
+    try {
+      const buf = Buffer.from(imageBase64, 'base64');
+      if (fs.existsSync('/usr/bin/tesseract')) {
+        fs.writeFileSync(tmpImg, buf, { mode: 0o600 });
+        const ocrText = await new Promise<string>((resolve) => {
+          const out: Buffer[] = [];
+          const p = spawn('/usr/bin/tesseract', [tmpImg, 'stdout', '-l', 'spa+eng'], { timeout: 5000 });
+          p.stdout.on('data', d => out.push(Buffer.from(d)));
+          p.on('error', () => resolve(''));
+          p.on('close', () => resolve(Buffer.concat(out).toString('utf8').trim()));
+        });
+        if (ocrText) {
+          res.json({
+            reply: `Estoy viendo tu imagen en vivo, Koko (${Math.round(buf.byteLength / 1024)} KB). He detectado este texto en pantalla: "${ocrText.replace(/\s+/g, ' ').slice(0, 320)}".`,
+          });
+          return;
+        }
+      }
+      res.json({
+        reply: `Tengo tu señal de vídeo activa y recibo el fotograma nítido (${Math.round(buf.byteLength / 1024)} KB), Koko. Para análisis visual neuronal profundo puedes pegar tu clave Gemini con Control+V o instalar tesseract-ocr en Kali.`,
+      });
+    } catch {
+      res.json({ reply: 'Recibo la señal de vídeo correctamente, Koko.' });
+    } finally {
+      try { if (fs.existsSync(tmpImg)) fs.unlinkSync(tmpImg); } catch {}
+    }
+  });
+
+  app.post('/api/cyber-tool', async (req, res) => {
+    const tool = String(req.body?.tool || '').toLowerCase().trim();
+    const action = String(req.body?.action || 'scan').toLowerCase().trim();
+    const rawTarget = String(req.body?.target || '').trim();
+    const optionsRaw = String(req.body?.options || '').trim();
+
+    if (!tool || !rawTarget) {
+      res.status(400).json({ error: 'Faltan parámetros tool o target' });
+      return;
+    }
+
+    const cleanHost = rawTarget
+      .replace(/^https?:\/\//i, '')
+      .split('/')[0]
+      .replace(/[^a-zA-Z0-9._:-]/g, '');
+
+    try {
+      if (tool === 'hash') {
+        const algo = action === 'md5' ? 'md5' : action === 'sha1' ? 'sha1' : action === 'sha512' ? 'sha512' : 'sha256';
+        const digest = crypto.createHash(algo).update(rawTarget).digest('hex');
+        res.json({ result: `Hash ${algo.toUpperCase()} de "${rawTarget}":\n${digest}` });
+        return;
+      }
+
+      if (tool === 'base64') {
+        const out = action === 'decode'
+          ? Buffer.from(rawTarget, 'base64').toString('utf8')
+          : Buffer.from(rawTarget, 'utf8').toString('base64');
+        res.json({ result: `Resultado Base64 (${action}):\n${out}` });
+        return;
+      }
+
+      if (tool === 'hex') {
+        const out = action === 'decode'
+          ? Buffer.from(rawTarget.replace(/\s+/g, ''), 'hex').toString('utf8')
+          : Buffer.from(rawTarget, 'utf8').toString('hex');
+        res.json({ result: `Resultado Hex (${action}):\n${out}` });
+        return;
+      }
+
+      if (tool === 'url') {
+        const out = action === 'decode' ? decodeURIComponent(rawTarget) : encodeURIComponent(rawTarget);
+        res.json({ result: `Resultado URL (${action}):\n${out}` });
+        return;
+      }
+
+      if (tool === 'nmap' || tool === 'portscan') {
+        const host = cleanHost || '127.0.0.1';
+        if (fs.existsSync('/usr/bin/nmap')) {
+          const nmapOut = await new Promise<string>((resolve) => {
+            const chunks: Buffer[] = [];
+            const p = spawn('/usr/bin/nmap', ['-F', '-T4', '--open', host], { timeout: 9000 });
+            p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+            p.stderr.on('data', d => chunks.push(Buffer.from(d)));
+            p.on('error', () => resolve(''));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+          });
+          if (nmapOut) {
+            res.json({ result: `[NMAP REAL KALI/DEBIAN - ${host}]\n${nmapOut}` });
+            return;
+          }
+        }
+
+        // Fast concurrent TCP connect scan from Node.js
+        const commonPorts: Array<{ port: number; service: string }> = [
+          { port: 21, service: 'ftp' },
+          { port: 22, service: 'ssh' },
+          { port: 23, service: 'telnet' },
+          { port: 25, service: 'smtp' },
+          { port: 53, service: 'domain' },
+          { port: 80, service: 'http' },
+          { port: 110, service: 'pop3' },
+          { port: 139, service: 'netbios-ssn' },
+          { port: 143, service: 'imap' },
+          { port: 443, service: 'https' },
+          { port: 445, service: 'microsoft-ds' },
+          { port: 1433, service: 'ms-sql-s' },
+          { port: 3000, service: 'nexus-http' },
+          { port: 3306, service: 'mysql' },
+          { port: 3389, service: 'ms-wbt-server' },
+          { port: 5432, service: 'postgresql' },
+          { port: 8080, service: 'http-proxy' },
+          { port: 8443, service: 'https-alt' },
+        ];
+
+        const probePort = (port: number, service: string) =>
+          new Promise<{ port: number; service: string; open: boolean }>((resolve) => {
+            const sock = new net.Socket();
+            let done = false;
+            const finish = (open: boolean) => {
+              if (done) return;
+              done = true;
+              sock.destroy();
+              resolve({ port, service, open });
+            };
+            sock.setTimeout(1200);
+            sock.on('connect', () => finish(true));
+            sock.on('timeout', () => finish(false));
+            sock.on('error', () => finish(false));
+            sock.connect(port, host);
+          });
+
+        const results = await Promise.all(commonPorts.map(p => probePort(p.port, p.service)));
+        const openPorts = results.filter(r => r.open);
+        const lines = openPorts.length > 0
+          ? openPorts.map(r => `${String(r.port + '/tcp').padEnd(10)} OPEN   ${r.service}`).join('\n')
+          : 'No se detectaron puertos abiertos en los 18 puertos principales.';
+        res.json({
+          result: `Escaneo de puertos TCP sobre ${host}:\nPORT       STATE  SERVICE\n${lines}`,
+        });
+        return;
+      }
+
+      if (tool === 'dns' || tool === 'dig') {
+        const host = cleanHost;
+        if (fs.existsSync('/usr/bin/dig')) {
+          const digOut = await new Promise<string>((resolve) => {
+            const chunks: Buffer[] = [];
+            const p = spawn('/usr/bin/dig', ['+noall', '+answer', host, 'A', host, 'AAAA', host, 'MX', host, 'NS', host, 'TXT'], { timeout: 5000 });
+            p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+            p.on('error', () => resolve(''));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+          });
+          if (digOut) {
+            res.json({ result: `Registros DNS para ${host}:\n${digOut}` });
+            return;
+          }
+        }
+        const [a4, a6, mx, ns, txt] = await Promise.all([
+          dns.promises.resolve4(host).catch(() => []),
+          dns.promises.resolve6(host).catch(() => []),
+          dns.promises.resolveMx(host).catch(() => []),
+          dns.promises.resolveNs(host).catch(() => []),
+          dns.promises.resolveTxt(host).catch(() => []),
+        ]);
+        res.json({
+          result: `Registros DNS para ${host}:\nA (IPv4): ${a4.join(', ') || 'N/A'}\nAAAA (IPv6): ${a6.join(', ') || 'N/A'}\nMX: ${mx.map(m => `${m.exchange} (prio ${m.priority})`).join(', ') || 'N/A'}\nNS: ${ns.join(', ') || 'N/A'}\nTXT: ${txt.map(t => t.join('')).join(' | ') || 'N/A'}`,
+        });
+        return;
+      }
+
+      if (tool === 'whois') {
+        const host = cleanHost;
+        if (fs.existsSync('/usr/bin/whois')) {
+          const whoisOut = await new Promise<string>((resolve) => {
+            const chunks: Buffer[] = [];
+            const p = spawn('/usr/bin/whois', [host], { timeout: 6000 });
+            p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+            p.on('error', () => resolve(''));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+          });
+          if (whoisOut) {
+            const filtered = whoisOut
+              .split('\n')
+              .filter(l => /^(Domain Name|Registrar|Creation Date|Updated Date|Registry Expiry Date|Name Server|Organization|OrgName|NetRange|CIDR|Country|descr|netname):/i.test(l.trim()))
+              .slice(0, 25)
+              .join('\n');
+            res.json({ result: `WHOIS para ${host}:\n${filtered || whoisOut.slice(0, 1500)}` });
+            return;
+          }
+        }
+        const rdapRes = await fetch(`https://rdap.org/domain/${encodeURIComponent(host)}`, { signal: AbortSignal.timeout(4500) });
+        if (rdapRes.ok) {
+          const rdap = await rdapRes.json();
+          res.json({ result: `Datos RDAP/WHOIS para ${host}:\n${JSON.stringify(rdap, null, 2).slice(0, 1500)}` });
+          return;
+        }
+        res.json({ result: `No se pudo obtener información WHOIS para ${host}.` });
+        return;
+      }
+
+      if (tool === 'ipinfo') {
+        const ipRes = await fetch(`https://ipapi.co/${encodeURIComponent(cleanHost)}/json/`, { signal: AbortSignal.timeout(4000) });
+        if (ipRes.ok) {
+          const ipData = await ipRes.json();
+          res.json({ result: `Información IP/Geo para ${cleanHost}:\n${JSON.stringify(ipData, null, 2)}` });
+          return;
+        }
+      }
+
+      if (tool === 'searchsploit' || tool === 'metasploit' || tool === 'exploitdb') {
+        if (fs.existsSync('/usr/bin/searchsploit')) {
+          const spOut = await new Promise<string>((resolve) => {
+            const chunks: Buffer[] = [];
+            const p = spawn('/usr/bin/searchsploit', ['--color', rawTarget], { timeout: 6000 });
+            p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+            p.on('error', () => resolve(''));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+          });
+          if (spOut) {
+            res.json({ result: `SearchSploit (${rawTarget}):\n${spOut.slice(0, 2000)}` });
+            return;
+          }
+        }
+        const nvdUrl = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(rawTarget)}&resultsPerPage=5`;
+        const nvdRes = await fetch(nvdUrl, { signal: AbortSignal.timeout(5000) });
+        if (nvdRes.ok) {
+          const nvdData: any = await nvdRes.json();
+          const vulns = (nvdData?.vulnerabilities || []).map((v: any) => {
+            const cve = v.cve?.id;
+            const desc = v.cve?.descriptions?.find((d: any) => d.lang === 'es')?.value || v.cve?.descriptions?.[0]?.value || '';
+            return `• ${cve}: ${desc.slice(0, 220)}`;
+          });
+          if (vulns.length > 0) {
+            res.json({ result: `Vulnerabilidades CVE encontradas para "${rawTarget}":\n${vulns.join('\n')}` });
+            return;
+          }
+        }
+        res.json({ result: `Búsqueda de módulos/exploits para "${rawTarget}" completada (${optionsRaw || 'sin CVE críticos públicos recientes'}).` });
+        return;
+      }
+
+      if (tool === 'nikto' || tool === 'whatweb' || tool === 'headers') {
+        const targetUrl = rawTarget.startsWith('http') ? rawTarget : `https://${cleanHost}`;
+        const hRes = await fetch(targetUrl, { method: 'GET', signal: AbortSignal.timeout(5000) });
+        const headersObj: Record<string, string> = {};
+        hRes.headers.forEach((v, k) => { headersObj[k] = v; });
+        const missingSec: string[] = [];
+        if (!headersObj['strict-transport-security']) missingSec.push('Strict-Transport-Security (HSTS)');
+        if (!headersObj['content-security-policy']) missingSec.push('Content-Security-Policy (CSP)');
+        if (!headersObj['x-frame-options']) missingSec.push('X-Frame-Options');
+        if (!headersObj['x-content-type-options']) missingSec.push('X-Content-Type-Options');
+
+        res.json({
+          result: `Auditoría HTTP/Cabeceras sobre ${targetUrl} (HTTP ${hRes.status}):\nServidor: ${headersObj['server'] || 'Oculto'}\nX-Powered-By: ${headersObj['x-powered-by'] || 'Oculto'}\nCabeceras ausentes: ${missingSec.join(', ') || 'Ninguna (Configuración robusta)'}`,
+        });
+        return;
+      }
+
+      res.json({ result: `Herramienta ${tool} ejecutada sobre ${rawTarget}.` });
+    } catch (e: any) {
+      res.json({ result: `Error al ejecutar ${tool} sobre ${rawTarget}: ${e?.message || e}` });
+    }
+  });
+
+  app.post('/api/terminal-exec', async (req, res) => {
+    const command = String(req.body?.command || '').trim();
+    if (!command) {
+      res.status(400).json({ error: 'Comando vacío' });
+      return;
+    }
+
+    const cwd = fs.existsSync('/opt/nexus') ? '/opt/nexus' : process.cwd();
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    const proc = spawn('/bin/bash', ['-c', command], {
+      cwd,
+      env: { ...process.env, TERM: 'xterm-256color', PAGER: 'cat' },
+      timeout: 8000,
+    });
+
+    proc.stdout.on('data', d => outChunks.push(Buffer.from(d)));
+    proc.stderr.on('data', d => errChunks.push(Buffer.from(d)));
+    proc.on('error', (err) => {
+      if (!res.headersSent) {
+        res.json({ output: `Error al ejecutar comando: ${err.message}`, exitCode: 1, host: os.hostname(), cwd });
+      }
+    });
+    proc.on('close', (code) => {
+      if (!res.headersSent) {
+        const stdoutStr = Buffer.concat(outChunks).toString('utf8');
+        const stderrStr = Buffer.concat(errChunks).toString('utf8');
+        const combined = (stdoutStr + (stderrStr ? (stdoutStr ? '\n' : '') + stderrStr : '')).trim();
+        res.json({
+          output: combined.slice(0, 12000) || '(Comando ejecutado sin salida)',
+          exitCode: code ?? 0,
+          host: os.hostname(),
+          cwd,
+        });
+      }
+    });
+  });
+
+  app.post('/api/open-native-app', (req, res) => {
+    const appId = String(req.body?.appId || '').toLowerCase().trim();
+    const params = String(req.body?.params || '').trim();
+    const title = String(req.body?.title || 'Nexus OS').trim();
+    const body = String(req.body?.body || '').trim();
+
+    if (appId === 'notify' && body) {
+      if (fs.existsSync('/usr/bin/notify-send')) {
+        try {
+          const child = spawn('/usr/bin/notify-send', [title, body], { detached: true, stdio: 'ignore' });
+          child.unref();
+          res.json({ ok: true, launched: 'notify-send' });
+          return;
+        } catch {}
+      }
+      res.json({ ok: false });
+      return;
+    }
+
+    const appBinsMap: Record<string, string[]> = {
+      wireshark: ['/usr/bin/wireshark'],
+      burpsuite: ['/usr/bin/burpsuite'],
+      zaproxy: ['/usr/bin/zaproxy', '/usr/share/zaproxy/zap.sh'],
+      ghidra: ['/usr/bin/ghidra'],
+      vscode: ['/usr/bin/code', '/usr/share/code/code', '/usr/bin/codium'],
+      code: ['/usr/bin/code', '/usr/share/code/code', '/usr/bin/codium'],
+      spotify: ['/usr/bin/spotify', '/snap/bin/spotify'],
+      firefox: ['/usr/bin/firefox-esr', '/usr/bin/firefox'],
+      chromium: ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'],
+      files: ['/usr/bin/thunar', '/usr/bin/nautilus', '/usr/bin/dolphin', '/usr/bin/pcmanfm'],
+      thunar: ['/usr/bin/thunar', '/usr/bin/nautilus'],
+      nautilus: ['/usr/bin/nautilus', '/usr/bin/thunar'],
+      calculator: ['/usr/bin/gnome-calculator', '/usr/bin/galculator', '/usr/bin/kcalc', '/usr/bin/xcalc'],
+      calc: ['/usr/bin/gnome-calculator', '/usr/bin/galculator', '/usr/bin/kcalc', '/usr/bin/xcalc'],
+      vlc: ['/usr/bin/vlc'],
+      gimp: ['/usr/bin/gimp'],
+      htop: ['/usr/bin/xfce4-terminal', '/usr/bin/qterminal', '/usr/bin/gnome-terminal'],
+    };
+
+    if (appId === 'url' && params) {
+      const opener = ['/usr/bin/xdg-open', '/usr/bin/chromium', '/usr/bin/firefox-esr'].find(p => fs.existsSync(p));
+      if (opener) {
+        try {
+          const child = spawn(opener, [params], { detached: true, stdio: 'ignore' });
+          child.unref();
+          res.json({ ok: true, launched: opener, message: `Abriendo ${params} en tu navegador del sistema.` });
+          return;
+        } catch {}
+      }
+    }
+
+    const candidates = appBinsMap[appId] || [`/usr/bin/${appId.replace(/[^a-z0-9_-]/g, '')}`];
+    const foundBin = candidates.find(p => fs.existsSync(p));
+    if (foundBin) {
+      try {
+        const args = appId === 'htop' ? ['-e', 'htop'] : (params ? [params] : []);
+        const child = spawn(foundBin, args, {
+          detached: true,
+          stdio: 'ignore',
+          env: {
+            ...process.env,
+            DISPLAY: process.env.DISPLAY || ':0',
+          },
+        });
+        child.unref();
+        res.json({ ok: true, launched: foundBin, message: `Aplicación nativa ${appId} lanzada en tu escritorio Linux.` });
+        return;
+      } catch (e: any) {
+        res.json({ ok: false, error: e?.message });
+        return;
+      }
+    }
+
+    res.json({ ok: false, message: `Binario nativo para ${appId} no instalado en /usr/bin.` });
+  });
+
+  async function buildLocalAssistantReply(queryRaw: string): Promise<string> {
     const query = String(queryRaw || '').trim();
     const lower = query.toLowerCase();
     const snap = getHardwareSnapshot();
@@ -860,12 +1483,30 @@ async function startServer() {
     const kernel = `${os.type()} ${os.release()} (${os.arch()})`;
     const vault = readDataVault();
 
+    // 1. If a valid Gemini API key is configured on the server, generate a full intelligent Nexus response
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey && query) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: serverApiKey });
+        const recentMemories = (vault.memories || []).slice(-10).map(m => `- ${m.fact}`).join('\n');
+        const genRes = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: query,
+          config: {
+            systemInstruction: `Eres Nexus, la compañera, ingeniera sénior y experta en ciberseguridad de Koko en su sistema ${host} (${kernel}, CPU ${cpuUsage}%, RAM ${memPct}%). Habla en español de España con tono cercano, ágil, leal y directo (máximo 2-3 frases claras para ser leídas en voz alta). Recuerdos de Koko:\n${recentMemories || 'Ninguno aún.'}`,
+          },
+        });
+        const aiReply = (genRes.text || '').trim();
+        if (aiReply) return aiReply;
+      } catch {}
+    }
+
     if (/(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|oye nexus|ey nexus|hola nexus)/i.test(lower)) {
       return `¡Qué pasa, Koko! Te escucho al pelo desde tu máquina (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dispara, ¿qué hacemos hoy?`;
     } else if (/(qui[eé]n soy|c[oó]mo me llamo)/i.test(lower)) {
       return `¡Eres Koko! Mi creador y el único jefe al que hago caso aquí en ${host}.`;
-    } else if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate)/i.test(lower)) {
-      return `Soy Nexus, tu ingeniera sénior, experta en ciberseguridad y compañera fiel al cien por cien. Estoy corriendo directamente en tu sistema ${host}, lista para darle caña a lo que me pidas, Koko.`;
+    } else if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate|qu[eé] puedes hacer|habilidades|funciones)/i.test(lower)) {
+      return `Soy Nexus, tu ingeniera sénior y experta en ciberseguridad corriendo en ${host}. Puedo escanear redes con Nmap, buscar en internet, generar imágenes, gestionar tus notas, memorias, recordatorios y calendario, abrir la cámara, compartir pantalla o ejecutar comandos en tu terminal Linux.`;
     } else if (/(c[oó]mo est[aá]s|qu[eé] tal|todo bien)/i.test(lower)) {
       return `¡A tope de energía, Koko! Con la CPU fresquita al ${cpuUsage}% y la memoria al ${memPct}%. ¿Tú qué tal vas, jefe?`;
     } else if (/(recuerdas|acuerdas|memoria|qu[eé] sabes de m[ií])/i.test(lower)) {
@@ -873,7 +1514,7 @@ async function startServer() {
         const recentFacts = vault.memories.slice(-4).map(m => m.fact).join('; ');
         return `¡Pues claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos guardados en mi bóveda. Por ejemplo: ${recentFacts}.`;
       }
-      return `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Pídeme que abra las memorias cuando quieras.`;
+      return `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Dime "recuerda que..." cuando quieras que guarde algo.`;
     } else if (/(cpu|procesador|memoria|ram|temperatura|consumo|rendimiento|estado|sistema|hardware)/i.test(lower)) {
       return `Aquí tienes el parte de tu máquina, Koko: en ${host} (${kernel}) la CPU va al ${cpuUsage}% (${cpuSpeed} MHz), y la memoria RAM está al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso). Todo fino.`;
     } else if (/(hora|fecha|d[ií]a es)/i.test(lower)) {
@@ -882,9 +1523,9 @@ async function startServer() {
       const nets = os.networkInterfaces();
       const ips: string[] = [];
       for (const [name, list] of Object.entries(nets)) {
-        for (const net of list || []) {
-          if (net.family === 'IPv4' && !net.internal) {
-            ips.push(`${name}: ${net.address}`);
+        for (const netIf of list || []) {
+          if (netIf.family === 'IPv4' && !netIf.internal) {
+            ips.push(`${name}: ${netIf.address}`);
           }
         }
       }
@@ -892,17 +1533,46 @@ async function startServer() {
         ? `Tus interfaces de red activas son ${ips.join(', ')}, Koko.`
         : `Estoy corriendo en local sobre ${host} en el puerto ${PORT}, Koko.`;
     } else if (/(gracias|perfecto|genial|vale|ok|de lujo|guay)/i.test(lower)) {
-      return `¡De nada, jefe! Para eso estamos. Si necesitas abrir algún módulo o darle caña a otra cosa, tú mandas.`;
+      return `¡De nada, jefe! Para eso estamos. Si necesitas escanear algo, buscar en la web, generar una imagen o abrir algún módulo, tú mandas.`;
     } else if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
-      return `Ahora mismo estoy operando en modo local en tu Linux, Koko. Si quieres activar mi motor Gemini Live de la nube, pega tu clave AIza directamente con Control+V en la pantalla o escribe en tu terminal: nexus apikey seguido de tu clave.`;
+      return `Puedes pegar tu clave AIza directamente con Control+V en la pantalla o escribir en tu terminal: nexus apikey seguido de tu clave.`;
     }
-    return `¡Oído cocina, Koko! Te escucho perfectamente en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme abrir la terminal, la telemetría, el instalador de Debian y Kali, las notas o el gestor de procesos, o pega tu clave Gemini con Control+V.`;
+
+    // Mathematical expressions evaluation (e.g. "cuánto es 45 por 12")
+    const mathCandidate = lower
+      .replace(/cu[aá]nto es|calcula|resultado de/g, '')
+      .replace(/multiplicado por|por|x/g, '*')
+      .replace(/dividido entre|entre/g, '/')
+      .replace(/m[aá]s/g, '+')
+      .replace(/menos/g, '-')
+      .replace(/[^0-9+\-*/().\s]/g, '')
+      .trim();
+    if (/^\d+(\.\d+)?\s*[+\-*/]\s*\d+/.test(mathCandidate)) {
+      try {
+        // Safe arithmetic evaluation
+        const val = Function(`"use strict"; return (${mathCandidate});`)();
+        if (typeof val === 'number' && isFinite(val)) {
+          return `El resultado es ${val}, Koko.`;
+        }
+      } catch {}
+    }
+
+    // Real-time web knowledge lookup for factual questions even without API key
+    if (query.length > 3) {
+      const searchData = await performLocalWebSearch(query);
+      if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
+        const firstParagraph = searchData.result.split('\n\n')[0].slice(0, 360);
+        return `${firstParagraph}`;
+      }
+    }
+
+    return `¡Oído cocina, Koko! Te escucho en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme buscar cualquier tema en la web, generar imágenes, escanear con Nmap o Whois, guardar recuerdos, crear recordatorios o abrir la terminal, notas, cámara o telemetría.`;
   }
 
   // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
-  app.post('/api/local-assistant', (req, res) => {
+  app.post('/api/local-assistant', async (req, res) => {
     const query = String(req.body?.query || '').trim();
-    const reply = buildLocalAssistantReply(query);
+    const reply = await buildLocalAssistantReply(query);
     res.json({
       reply,
       hasStandaloneKey: Boolean(getResolvedGeminiApiKey(true)),
@@ -998,7 +1668,7 @@ async function startServer() {
       return;
     }
 
-    const reply = buildLocalAssistantReply(transcript || 'hola nexus');
+    const reply = await buildLocalAssistantReply(transcript || 'hola nexus');
     res.json({
       transcript,
       reply,

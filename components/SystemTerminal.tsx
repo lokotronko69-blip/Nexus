@@ -75,29 +75,45 @@ export const SystemTerminal: React.FC<SystemTerminalProps> = ({ onClose, onExecu
         let outputText = '';
         let outputType: 'output' | 'error' | 'system' = 'output';
 
+        const runServerShell = async (shellCmd: string): Promise<{ output: string; isError: boolean }> => {
+            try {
+                const r = await fetch('/api/terminal-exec', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: shellCmd }),
+                });
+                if (r.ok) {
+                    const d = await r.json();
+                    return {
+                        output: d.output || '(Comando ejecutado)',
+                        isError: typeof d.exitCode === 'number' && d.exitCode !== 0 && !d.output,
+                    };
+                }
+            } catch {}
+            return { output: '', isError: true };
+        };
+
         switch (command) {
             case 'help':
-                outputText = `Comandos del Sistema Nexus:
+                outputText = `Comandos del Sistema Nexus (Soporta comandos nativos Bash / Kali Linux):
   apps              - Lista las aplicaciones integradas y su estado
-  open <app>        - Abre una aplicación (telemetry, notes, canvas, camera, screen, process)
+  open <app>        - Abre una aplicación (telemetry, notes, canvas, camera, screen, process, wireshark, code...)
   close <app>       - Cierra una aplicación activa
   status            - Muestra el estado del núcleo Nexus y sensores
-  top / ps          - Muestra los procesos y consumo de recursos
-  mem               - Muestra el estado de la memoria RAM física y Heap
-  cpu               - Información de núcleos de CPU y velocidad de reloj
-  net               - Estadísticas de la interfaz de red y latencia
-  clear             - Limpia la pantalla de la terminal
-  date              - Muestra la fecha y hora del sistema
-  uname -a          - Información del kernel y arquitectura
-  whoami            - Identidad del usuario actual
-  echo <texto>      - Imprime texto en pantalla
+  top / ps          - Muestra los procesos reales del sistema en ejecución
+  mem / free        - Muestra el estado real de la memoria RAM física y Swap
+  cpu / lscpu       - Información real de núcleos de CPU y carga
+  net / ip          - Interfaces de red reales y puertos activos
+  nmap <objetivo>   - Ejecuta escaneo de puertos real sobre un host o IP
+  whois / dig <dom> - Consulta registros WHOIS o DNS reales
   say <texto>       - Ordena a Nexus pronunciar el texto en voz alta
-  voice [nombre]    - Muestra o cambia la voz (SOLO Koko puede cambiarla; por defecto: Kore)
+  voice             - Muestra la configuración de voz de Nexus (Kore)
   apikey <clave>    - Actualiza en caliente GEMINI_API_KEY en /opt/nexus/.env y reconecta
   version / vault   - Muestra versión activa, bóveda de datos y hash SHA-256
-  update            - Sincroniza bóveda de datos y abre el actualizador atómico delta
-  debian            - Abre el panel con todos los comandos para instalar Nexus en Debian
-  exit / close      - Cierra la terminal`;
+  update / debian   - Abre el instalador y actualizador atómico delta para Debian/Kali
+  clear             - Limpia la pantalla de la terminal
+  exit / close      - Cierra la terminal
+  * Cualquier comando de Linux (ls, pwd, df -h, uname -a, cat, etc.) se ejecuta en el sistema real.`;
                 break;
 
             case 'clear':
@@ -105,14 +121,18 @@ export const SystemTerminal: React.FC<SystemTerminalProps> = ({ onClose, onExecu
                 setInput('');
                 return;
 
-            case 'whoami':
-                outputText = 'koko (Administrador del Sistema Nexus - Acceso Total)';
+            case 'whoami': {
+                const srv = await runServerShell('whoami && id');
+                outputText = srv.output || 'koko (Administrador del Sistema Nexus - Acceso Total)';
                 break;
+            }
 
             case 'uname':
-            case 'uname -a':
-                outputText = 'Linux nexus-core 6.12.0 #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux';
+            case 'uname -a': {
+                const srv = await runServerShell(trimmed.startsWith('uname') ? trimmed : 'uname -a');
+                outputText = srv.output || 'Linux nexus-core 6.12.0 #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux';
                 break;
+            }
 
             case 'date':
                 outputText = new Date().toString();
@@ -124,11 +144,12 @@ export const SystemTerminal: React.FC<SystemTerminalProps> = ({ onClose, onExecu
 
             case 'status':
                 outputText = `ESTADO DE NEXUS OS:
-  Núcleo: Operativo [EN LÍNEA]
-  Voz y Audio: Activo (WebAudio API + SpeechSynthesizer)
-  Visión: Preparada (Cámara + Captura de Pantalla)
+  Núcleo: Operativo [EN LÍNEA - v1.3.0]
+  Voz y Audio: Activo (WebAudio API + VAD + Síntesis Neuronal/Local)
+  Visión: Preparada (Cámara + Captura de Pantalla + OCR/Visión)
+  Ciberseguridad: Activa (Nmap, Portscan TCP, Whois, Dig, SearchSploit, Hashes)
   Hardware Sync: WebSocket 1000ms a /proc/stat y /proc/meminfo
-  Integración con SO: Habilitada (Notificaciones + Protocolos URI)`;
+  Integración con SO: Habilitada (Lanzador Nativo Linux + Notificaciones)`;
                 break;
 
             case 'apps':
@@ -143,10 +164,10 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
 
             case 'open':
                 if (!args[0]) {
-                    outputText = 'Uso: open <nombre_app>\nEjemplos: open telemetry, open notes, open canvas, open camera, open spotify, open vscode';
+                    outputText = 'Uso: open <nombre_app>\nEjemplos: open telemetry, open notes, open canvas, open camera, open wireshark, open vscode';
                     outputType = 'error';
                 } else if ((window as any).nexus && (window as any).nexus.openApp) {
-                    outputText = (window as any).nexus.openApp(args[0], args.slice(1).join(' '));
+                    outputText = await (window as any).nexus.openApp(args[0], args.slice(1).join(' '));
                 } else {
                     outputText = `Abriendo ${args[0]}...`;
                 }
@@ -164,38 +185,29 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                 break;
 
             case 'top':
-            case 'ps':
-                outputText = `PID   USUARIO   %CPU  %MEM  TIEMPO   PROCESO
-  1   koko       1.2   4.5  02:14   nexus-kernel
- 42   koko       4.8   8.2  01:05   gemini-live-engine
- 77   koko       0.4   2.1  00:45   hardware-monitor-daemon
-108   koko       0.8   1.5  00:18   audio-synthesis-service
-145   koko       0.2   0.8  00:03   nexus-system-terminal [ACTIVO]`;
+            case 'ps': {
+                const srv = await runServerShell('ps aux --sort=-%mem | head -n 15');
+                outputText = srv.output || 'No se pudo obtener la tabla de procesos.';
                 break;
+            }
 
-            case 'mem':
-                outputText = `MEMORIA DEL SISTEMA:
-  Total Físico: 4096 MB
-  Disponible:   3430 MB
-  En Uso (OS):  666 MB (16.2%)
-  Caché/Buffer: 374 MB
-  Heap Node.js: 49 MB usado / 74 MB total`;
+            case 'mem': {
+                const srv = await runServerShell('free -h && grep -E "MemTotal|MemAvailable|SwapTotal|SwapFree" /proc/meminfo 2>/dev/null');
+                outputText = srv.output || 'Memoria disponible.';
                 break;
+            }
 
-            case 'cpu':
-                outputText = `CPU DEL SISTEMA:
-  Modelo: GenuineIntel (2 núcleos / 2 hilos)
-  Reloj:  3463 MHz
-  Caché:  8192 KB
-  Carga:  Baja / Óptima`;
+            case 'cpu': {
+                const srv = await runServerShell('lscpu 2>/dev/null | grep -E "Architecture|CPU\\(s\\)|Model name|MHz" || head -n 20 /proc/cpuinfo');
+                outputText = srv.output || 'CPU operativa.';
                 break;
+            }
 
-            case 'net':
-                outputText = `RED DEL SISTEMA:
-  Interfaces: eth0 (activa), eth1, eth2, lo
-  Estado:     Conectado
-  Latencia:   ~15 ms (RTT Ultrarrápido)`;
+            case 'net': {
+                const srv = await runServerShell('ip -brief addr 2>/dev/null || hostname -I');
+                outputText = srv.output || 'Interfaces de red activas.';
                 break;
+            }
 
             case 'say':
                 if (args.length > 0 && (window as any).nexus && (window as any).nexus.speak) {
@@ -251,14 +263,14 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                     const r = await fetch('/api/version', { cache: 'no-store' });
                     const v = await r.json();
                     outputText = `ESTADO DE VERSIÓN Y BÓVEDA DE DATOS DE NEXUS:
-  Versión del Núcleo:   v${v.version || '1.2.0'}
+  Versión del Núcleo:   v${v.version || '1.3.0'}
   Ruta de la Bóveda:    ${v.vaultPath || '/opt/nexus/data/nexus-vault.json'}
   Integridad SHA-256:   ${v.vaultChecksum || 'verificado'}
   Memorias Protegidas:  ${v.memoriesCount ?? 0} registros
   Snapshots en Disco:   ${v.backupsCount ?? 0} en /var/backups/nexus`;
                     outputType = 'system';
                 } catch {
-                    outputText = 'Nexus v1.2.0 - Bóveda de datos local activa.';
+                    outputText = 'Nexus v1.3.0 - Bóveda de datos local activa.';
                     outputType = 'system';
                 }
                 break;
@@ -278,8 +290,12 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                 onClose();
                 return;
 
-            default:
-                if (onExecuteAction) {
+            default: {
+                const srv = await runServerShell(trimmed);
+                if (srv.output) {
+                    outputText = srv.output;
+                    if (srv.isError) outputType = 'error';
+                } else if (onExecuteAction) {
                     try {
                         outputText = await onExecuteAction(command, args);
                     } catch (e: any) {
@@ -291,6 +307,7 @@ ${apps.map((a: any) => `  • [${a.isOpen ? 'ACTIVA' : 'INACTIVA'}] ${a.id.padEn
                     outputType = 'error';
                 }
                 break;
+            }
         }
 
         const outputEntry: TerminalOutput = {

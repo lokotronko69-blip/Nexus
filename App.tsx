@@ -603,15 +603,17 @@ export const App: React.FC = () => {
                 } else if (id === 'screen' || id === 'pantalla') {
                     startScreenShare();
                     return "Compartición de pantalla iniciada.";
-                } else if (id === 'spotify') {
-                    window.open('spotify:', '_self');
-                    return "Lanzando Spotify en el sistema...";
-                } else if (id === 'vscode' || id === 'code') {
-                    window.open('vscode:', '_self');
-                    return "Lanzando Visual Studio Code en el sistema...";
-                } else if (id === 'calc' || id === 'calculator' || id === 'calculadora') {
-                    window.open('calculator:', '_self');
-                    return "Lanzando calculadora del sistema...";
+                } else if (['wireshark', 'burpsuite', 'zaproxy', 'ghidra', 'vscode', 'code', 'spotify', 'firefox', 'chromium', 'thunar', 'nautilus', 'files', 'calc', 'calculator', 'calculadora', 'vlc', 'gimp', 'htop'].includes(id)) {
+                    const normalizedApp = id === 'calculadora' ? 'calculator' : id;
+                    fetch('/api/open-native-app', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ appId: normalizedApp, params: params || '' })
+                    }).catch(() => {});
+                    if (id === 'spotify') window.open('spotify:', '_self');
+                    else if (id === 'vscode' || id === 'code') window.open('vscode:', '_self');
+                    else if (id === 'calc' || id === 'calculator' || id === 'calculadora') window.open('calculator:', '_self');
+                    return `Lanzando ${appId} en tu sistema Linux...`;
                 } else if (id === 'mail' || id === 'correo') {
                     window.open(`mailto:${params || ''}`, '_self');
                     return "Abriendo cliente de correo del sistema...";
@@ -620,11 +622,16 @@ export const App: React.FC = () => {
                     return "Abriendo calendario del sistema...";
                 } else {
                     if (id.startsWith('http://') || id.startsWith('https://')) {
+                        fetch('/api/open-native-app', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ appId: 'url', params: id })
+                        }).catch(() => {});
                         window.open(id, '_blank', 'noopener,noreferrer');
                         return `Abriendo aplicación web: ${id}`;
                     }
                     setShowTerminal(true);
-                    return `Aplicación '${id}' no reconocida directamente. He abierto la terminal del sistema para que puedas gestionarla.`;
+                    return `Aplicación '${id}' gestionada desde la terminal del sistema.`;
                 }
             },
             closeApp: (appId: string) => {
@@ -2048,12 +2055,374 @@ export const App: React.FC = () => {
 
         saveTranscript(transcript, 'user');
 
+        const speakAndSaveReply = (replyText: string) => {
+            saveTranscript(replyText, 'model');
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak(replyText);
+            }
+        };
+
+        const lower = transcript.toLowerCase().trim();
+        const isCloseCmd = /(cierra|cerrar|quita|quitar|oculta|ocultar|esconde|desactiva|apaga|det[eé]n|para)/i.test(lower);
+
+        // 1. Camera, Optical Zoom, Video Recording & Screen Share controls
+        if (/(grabar v[ií]deo|empieza a grabar|inicia la grabaci[oó]n|graba esto|haz un v[ií]deo|para de grabar|det[eé]n la grabaci[oó]n|termina la grabaci[oó]n)/i.test(lower)) {
+            if (/(para|det[eé]n|termina|cierra|finaliza)/i.test(lower)) {
+                stopRecording();
+                speakAndSaveReply("Grabación de vídeo detenida y archivo guardado, Koko.");
+                return;
+            }
+            if (!isCameraActiveRef.current) {
+                await startCamera('user');
+            }
+            setTimeout(() => startRecording(), 300);
+            speakAndSaveReply("¡Oído cocina, Koko! Cámara activa y grabando vídeo.");
+            return;
+        }
+
+        if (/(zoom.*c[aá]mara|acerca la c[aá]mara|aleja la c[aá]mara|quita el zoom de la c[aá]mara)/i.test(lower)) {
+            const numMatch = lower.match(/(\d+(?:\.\d+)?)/);
+            const targetZoom = /quita|aleja|reset/i.test(lower) ? 1 : (numMatch ? parseFloat(numMatch[1]) : 2);
+            if (!isCameraActiveRef.current) {
+                await startCamera('user');
+            }
+            const applied = (window as any).nexus?.setCameraZoom ? (window as any).nexus.setCameraZoom(targetZoom) : targetZoom;
+            speakAndSaveReply(`Zoom de la cámara ajustado a ${applied}x, Koko.`);
+            return;
+        }
+
+        if (/(c[aá]mara|ojos|m[ií]rame)/i.test(lower) && /(abre|abrir|activa|activar|enciende|encender|pon|cierra|cerrar|apaga|apagar|desactiva|m[ií]rame)/i.test(lower)) {
+            if (isCloseCmd) {
+                stopCamera();
+                speakAndSaveReply("Cámara desactivada, Koko.");
+                return;
+            }
+            const mode = /trasera|posterior|environment/i.test(lower) ? 'environment' : 'user';
+            const ok = await startCamera(mode);
+            speakAndSaveReply(ok ? "¡Cámara activada, Koko! Ya te estoy viendo en directo." : "No he podido abrir la cámara, Koko. Revisa los permisos del dispositivo.");
+            return;
+        }
+
+        if (/(comparte.*pantalla|compartir.*pantalla|mira mi pantalla|ver mi pantalla|deja de compartir|segunda pantalla|otra pantalla)/i.test(lower)) {
+            if (/segunda|otra|adicional/i.test(lower) && (window as any).nexus?.addScreenShare) {
+                const msg = await (window as any).nexus.addScreenShare();
+                speakAndSaveReply(msg);
+                return;
+            }
+            if (isCloseCmd || /deja de compartir/i.test(lower)) {
+                stopScreenShare();
+                speakAndSaveReply("Compartición de pantalla detenida, Koko.");
+                return;
+            }
+            const ok = await startScreenShare();
+            speakAndSaveReply(ok ? "¡Pantalla compartida en vivo, Koko! Ya veo tu escritorio." : "Selecciona la ventana o pantalla que quieras mostrarme, Koko.");
+            return;
+        }
+
+        // 2. Real-time Vision / Screen / Camera Frame Analysis ("¿qué ves?", "¿qué hay en mi pantalla?")
+        if (/(qu[eé] ves|qu[eé] est[aá]s viendo|describe lo que ves|qu[eé] hay en mi pantalla|analiza la pantalla|analiza la c[aá]mara|lee la pantalla)/i.test(lower)) {
+            if ((isCameraActiveRef.current || isScreenSharingRef.current) && videoRef.current && canvasRef.current && videoRef.current.readyState >= 2) {
+                const ctx = canvasRef.current.getContext('2d');
+                if (ctx) {
+                    canvasRef.current.width = 640;
+                    canvasRef.current.height = 360;
+                    ctx.drawImage(videoRef.current, 0, 0, 640, 360);
+                    const imageBase64 = canvasRef.current.toDataURL('image/jpeg', 0.75);
+                    try {
+                        const vRes = await fetch('/api/analyze-vision', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ imageBase64, prompt: transcript })
+                        });
+                        if (vRes.ok) {
+                            const vData = await vRes.json();
+                            if (vData?.reply) {
+                                speakAndSaveReply(vData.reply);
+                                return;
+                            }
+                        }
+                    } catch {}
+                }
+            } else {
+                speakAndSaveReply("Ahora mismo tienes la cámara y la pantalla compartida apagadas, Koko. Dime 'activa la cámara' o 'mira mi pantalla' y te digo qué veo al instante.");
+                return;
+            }
+        }
+
+        // 3. Long-Term Memory saving & retrieval ("recuerda que...", "guarda en tu memoria...", "¿qué recuerdas?")
+        const memorySaveMatch = transcript.match(/^(?:nexus[, ]+)?(?:recuerda que|guarda en tu memoria que|guarda en la memoria que|memoriza que|no olvides que|apunta en tu memoria que|recuerda esto:?)\s+(.+)$/i);
+        if (memorySaveMatch && memorySaveMatch[1]) {
+            const fact = memorySaveMatch[1].trim();
+            await saveMemoryToStorage(fact, 'personal');
+            setMemories(getMemoriesArray());
+            speakAndSaveReply(`¡Guardado a fuego en mi bóveda de memorias, Koko! Recordaré que: ${fact}.`);
+            return;
+        }
+
+        if (/^(?:nexus[, ]+)?(?:qu[eé] recuerdas|qu[eé] sabes de m[ií]|dime mis recuerdos|dime mis memorias|lee mis memorias|busca en tu memoria)\b/i.test(lower)) {
+            const searchQ = transcript.replace(/^(?:nexus[, ]+)?(?:qu[eé] recuerdas sobre|qu[eé] recuerdas de|busca en tu memoria|qu[eé] recuerdas|qu[eé] sabes de m[ií]|dime mis recuerdos|dime mis memorias|lee mis memorias)\s*/i, '').trim();
+            const memText = await getAllMemoriesFromStorage(searchQ || undefined);
+            speakAndSaveReply(memText);
+            return;
+        }
+
+        // 4. System Notes read & write ("escribe en las notas...", "apunta en el bloc de notas...", "lee mis notas")
+        const noteWriteMatch = transcript.match(/^(?:nexus[, ]+)?(?:escribe en las notas|apunta en las notas|apunta en el bloc de notas|añade a las notas|toma nota:?|anota:?)\s+(.+)$/i);
+        if (noteWriteMatch && noteWriteMatch[1]) {
+            const newNote = noteWriteMatch[1].trim();
+            const existingNotes = localStorage.getItem('nexus_system_notes') || '# Notas del Sistema Nexus';
+            const updatedNotes = `${existingNotes}\n- [${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}] ${newNote}`;
+            localStorage.setItem('nexus_system_notes', updatedNotes);
+            fetch('/api/data-vault/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ notes: updatedNotes }),
+            }).catch(() => {});
+            setNotesInitialContent(newNote);
+            setShowNotes(true);
+            speakAndSaveReply(`¡Apuntado en tu bloc de notas, Koko! He escrito: ${newNote}.`);
+            return;
+        }
+
+        if (/(lee mis notas|qu[eé] hay en las notas|qu[eé] tengo apuntado en las notas|dime mis notas)/i.test(lower)) {
+            const currentNotes = (localStorage.getItem('nexus_system_notes') || '').trim();
+            setShowNotes(true);
+            if (!currentNotes) {
+                speakAndSaveReply("Tu bloc de notas está vacío todavía, Koko. Dime 'apunta en las notas' seguido de lo que quieras guardar.");
+            } else {
+                speakAndSaveReply(`Esto es lo que tienes en tus notas, Koko: ${currentNotes.replace(/#+\s*/g, '').slice(0, 350)}`);
+            }
+            return;
+        }
+
+        // 5. Reminders & Alarms ("recuérdame en X minutos...", "pon una alarma en X minutos...")
+        const reminderMatch = transcript.match(/(?:recu[eé]rdame|av[ií]same|pon un recordatorio|pon una alarma)\s+(?:en|dentro de)\s+(\d+)\s*(minutos?|min|segundos?|seg|horas?)\s*(?:que|para|:)?\s*(.*)$/i);
+        if (reminderMatch) {
+            const amount = Math.max(1, parseInt(reminderMatch[1], 10) || 1);
+            const unit = reminderMatch[2].toLowerCase();
+            const reminderMsg = (reminderMatch[3] || 'Revisar tarea pendiente').trim();
+            const ms = unit.startsWith('seg') ? amount * 1000 : unit.startsWith('hor') ? amount * 3600000 : amount * 60000;
+
+            if ('Notification' in window && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+                Notification.requestPermission().catch(() => {});
+            }
+
+            window.setTimeout(() => {
+                if ('Notification' in window && Notification.permission === 'granted') {
+                    new Notification('Nexus Recordatorio', { body: reminderMsg });
+                }
+                fetch('/api/open-native-app', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ appId: 'notify', title: 'Nexus Recordatorio', body: reminderMsg })
+                }).catch(() => {});
+                if ((window as any).nexus?.speak) {
+                    (window as any).nexus.speak(`¡Oye Koko! Recordatorio: ${reminderMsg}`);
+                }
+            }, ms);
+
+            speakAndSaveReply(`¡Hecho, Koko! Te avisaré dentro de ${amount} ${unit} para: ${reminderMsg}.`);
+            return;
+        }
+
+        // 6. Calendar / Agenda management ("añade al calendario...", "qué tengo en el calendario / agenda")
+        if (/(calendario|agenda|eventos)/i.test(lower)) {
+            const cal = JSON.parse(localStorage.getItem('nexus_calendar') || '[]');
+            const addCalMatch = transcript.match(/(?:a[ñn]ade|agrega|agenda|apunta|crea)\s+(?:al calendario|en la agenda|evento)\s+(.+)$/i);
+            if (addCalMatch && addCalMatch[1]) {
+                const title = addCalMatch[1].trim();
+                const dateStr = new Date().toLocaleString('es-ES');
+                cal.push({ id: Date.now(), title, date: dateStr });
+                localStorage.setItem('nexus_calendar', JSON.stringify(cal));
+                speakAndSaveReply(`Evento añadido a tu agenda, Koko: "${title}".`);
+                return;
+            }
+            if (/(borra|elimina|limpia|vac[ií]a).*(calendario|agenda|eventos)/i.test(lower)) {
+                localStorage.setItem('nexus_calendar', '[]');
+                speakAndSaveReply("He vaciado todos los eventos de tu calendario, Koko.");
+                return;
+            }
+            if (/(qu[eé] tengo|lista|ver|muestra|dime|eventos)/i.test(lower)) {
+                if (cal.length === 0) {
+                    speakAndSaveReply("No tienes eventos pendientes en tu calendario ahora mismo, Koko.");
+                } else {
+                    const summary = cal.map((e: any) => `${e.title} (${e.date})`).join('; ');
+                    speakAndSaveReply(`Tienes ${cal.length} eventos en tu agenda, Koko: ${summary}.`);
+                }
+                return;
+            }
+        }
+
+        // 7. Image Generation ("genera una imagen de...", "dibuja...", "crea una imagen de...")
+        const imgMatch = transcript.match(/^(?:nexus[, ]+)?(?:genera una imagen de|genera una imagen|crea una imagen de|crea una foto de|dibuja un|dibuja una|dibuja|haz un dibujo de|pinta un|pinta una)\s+(.+)$/i);
+        if (imgMatch && imgMatch[1] && !/^(la pizarra|el lienzo|el canvas)$/i.test(imgMatch[1].trim())) {
+            const imgPrompt = imgMatch[1].trim();
+            speakAndSaveReply(`¡Marchando, Koko! Estoy generando la imagen de "${imgPrompt}" ahora mismo...`);
+            const imageUrl = await generateImage(imgPrompt);
+            if (imageUrl && imageUrl.startsWith('data:')) {
+                const id = `img-${Date.now()}`;
+                const html = `<div style="padding: 10px; background: #090d16; border-radius: 10px; border: 1px solid rgba(34,211,238,0.3);"><img src="${imageUrl}" style="max-width: 380px; width: 100%; border-radius: 8px; display: block;" alt="${imgPrompt.replace(/"/g, '')}" /><div style="margin-top: 8px; font-size: 11px; color: #94a3b8; font-family: monospace;">Prompt: ${imgPrompt}</div></div>`;
+                (window as any).nexus?.createTool(id, html, `Imagen: ${imgPrompt.slice(0, 24)}`);
+                speakAndSaveReply(`¡Aquí tienes tu imagen de "${imgPrompt}" en pantalla, Koko!`);
+            } else {
+                speakAndSaveReply(imageUrl || "No pude generar la imagen en este momento, Koko.");
+            }
+            return;
+        }
+
+        // 8. Cybersecurity & Pentesting Tools (Nmap, Portscan, Whois, DNS/Dig, IPInfo, SearchSploit, Headers, Hash, Base64)
+        const cyberMatch = transcript.match(/(?:escanea con nmap|haz un nmap a|nmap a|nmap|escanea los puertos de|escanea puertos de|portscan a|portscan|haz un whois a|whois a|whois|consulta el dns de|resuelve el dns de|haz un dig a|dig a|ipinfo de|geolocaliza la ip|searchsploit|busca exploits para|metasploit|audita las cabeceras de|nikto a)\s+([^\s,]+.*)$/i);
+        if (cyberMatch) {
+            const rawTarget = cyberMatch[1].trim().split(/\s+/)[0];
+            let tool = 'nmap';
+            let action = 'scan';
+            if (/whois/i.test(lower)) { tool = 'whois'; action = 'lookup'; }
+            else if (/\b(dns|dig)\b/i.test(lower)) { tool = 'dns'; action = 'lookup'; }
+            else if (/ipinfo|geolocaliza/i.test(lower)) { tool = 'ipinfo'; action = 'lookup'; }
+            else if (/searchsploit|exploits|metasploit/i.test(lower)) { tool = 'searchsploit'; action = 'search'; }
+            else if (/cabeceras|nikto|headers/i.test(lower)) { tool = 'headers'; action = 'scan'; }
+            else if (/portscan|puertos/i.test(lower)) { tool = 'portscan'; action = 'scan'; }
+
+            speakAndSaveReply(`Ejecutando ${tool.toUpperCase()} sobre ${rawTarget}, Koko...`);
+            const cyberResult = await executeCyberSecurityTool(tool, action, rawTarget);
+            const toolCardId = `cyber-${Date.now()}`;
+            const safePre = cyberResult.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            (window as any).nexus?.createTool(
+                toolCardId,
+                `<pre style="font-family: monospace; font-size: 11px; color: #34d399; background: #020617; padding: 12px; border-radius: 8px; border: 1px solid rgba(16,185,129,0.3); max-width: 540px; overflow-x: auto; white-space: pre-wrap;">${safePre}</pre>`,
+                `Ciberseguridad: ${tool.toUpperCase()} (${rawTarget})`
+            );
+            const spokenSummary = cyberResult.split('\n').slice(0, 4).join('. ').slice(0, 280);
+            speakAndSaveReply(spokenSummary);
+            return;
+        }
+
+        const hashMatch = transcript.match(/(?:calcula el hash|hash|calcula el)\s+(md5|sha256|sha-256|sha1|sha-1|sha512|base64)\s+(?:de\s+)?(.+)$/i);
+        if (hashMatch) {
+            const kind = hashMatch[1].toLowerCase().replace('-', '');
+            const textTarget = hashMatch[2].trim();
+            const resText = kind === 'base64'
+                ? await executeCyberSecurityTool('base64', 'encode', textTarget)
+                : await executeCyberSecurityTool('hash', kind, textTarget);
+            speakAndSaveReply(resText);
+            return;
+        }
+
+        // 9. Dynamic Interactive Widgets ("crea una calculadora", "crea un generador de contraseñas")
+        if (/(crea una calculadora|abre una calculadora|calculadora en pantalla)/i.test(lower)) {
+            const html = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;width:240px;font-family:monospace;">
+                <input id="nx-calc-disp" readonly style="grid-column:span 4;background:#090d16;color:#38bdf8;border:1px solid #334155;padding:10px;font-size:18px;text-align:right;border-radius:6px;margin-bottom:4px;" value="" placeholder="0" />
+                ${['7','8','9','/','4','5','6','*','1','2','3','-','0','.','=','+'].map(b =>
+                    b === '='
+                        ? `<button onclick="try{const d=document.getElementById('nx-calc-disp');d.value=Function('return ('+d.value+')')();}catch{}" style="background:#0284c7;color:#fff;padding:10px;border-radius:6px;font-weight:bold;">=</button>`
+                        : `<button onclick="document.getElementById('nx-calc-disp').value+='${b}'" style="background:#1e293b;color:#e2e8f0;padding:10px;border-radius:6px;">${b}</button>`
+                ).join('')}
+                <button onclick="document.getElementById('nx-calc-disp').value=''" style="grid-column:span 4;background:#dc2626;color:#fff;padding:6px;border-radius:6px;margin-top:4px;">LIMPIAR</button>
+            </div>`;
+            (window as any).nexus?.createTool('calc-widget', html, 'Calculadora Nexus');
+            speakAndSaveReply("¡Hecho, Koko! Te he creado una calculadora interactiva en pantalla.");
+            return;
+        }
+
+        if (/(generador de contrase[ñn]as|crea una contrase[ñn]a segura|genera una clave segura)/i.test(lower)) {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-+=';
+            const bytes = new Uint32Array(20);
+            crypto.getRandomValues(bytes);
+            const pwd = Array.from(bytes).map(b => chars[b % chars.length]).join('');
+            const html = `<div style="font-family:monospace;padding:8px;max-width:340px;">
+                <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;">Contraseña Criptográfica (20 chars):</div>
+                <div style="background:#020617;color:#34d399;padding:10px;border-radius:6px;border:1px solid #10b981;word-break:break-all;font-size:14px;font-weight:bold;">${pwd}</div>
+                <button onclick="navigator.clipboard.writeText('${pwd}')" style="margin-top:8px;width:100%;background:#0284c7;color:#fff;padding:7px;border-radius:6px;font-size:12px;">Copiar al portapapeles</button>
+            </div>`;
+            (window as any).nexus?.createTool('pwd-gen', html, 'Generador de Contraseñas');
+            speakAndSaveReply("Te he generado una contraseña criptográfica de 20 caracteres en pantalla, Koko.");
+            return;
+        }
+
+        // 10. Browser & DOM Controls (Scroll, Zoom, Reload, Websites, Display Info, Native Linux Apps)
+        if (/(haz scroll|baja la p[aá]gina|sube la p[aá]gina|ve al final|ve al principio|ve arriba|ve abajo)/i.test(lower)) {
+            if (/sube|arriba|principio/i.test(lower)) {
+                window.scrollBy({ top: -window.innerHeight / 2, behavior: 'smooth' });
+                speakAndSaveReply("Subiendo la página, Koko.");
+            } else {
+                window.scrollBy({ top: window.innerHeight / 2, behavior: 'smooth' });
+                speakAndSaveReply("Bajando la página, Koko.");
+            }
+            return;
+        }
+
+        if (/(aumenta el zoom|acerca la p[aá]gina|reduce el zoom|aleja la p[aá]gina|restablece el zoom)/i.test(lower)) {
+            if (/restablece|normal|100/i.test(lower)) {
+                document.body.style.transform = '';
+                document.body.removeAttribute('data-scale');
+                speakAndSaveReply("Zoom de pantalla restablecido al 100%, Koko.");
+            } else {
+                const cur = parseFloat(document.body.getAttribute('data-scale') || '1');
+                const next = /reduce|aleja/i.test(lower) ? Math.max(0.6, cur - 0.1) : Math.min(1.6, cur + 0.1);
+                document.body.style.transform = `scale(${next})`;
+                document.body.style.transformOrigin = 'top center';
+                document.body.setAttribute('data-scale', String(next));
+                speakAndSaveReply(`Zoom ajustado al ${Math.round(next * 100)}%, Koko.`);
+            }
+            return;
+        }
+
+        if (/(resoluci[oó]n de.*pantalla|informaci[oó]n de.*pantalla|cu[aá]ntos monitores)/i.test(lower)) {
+            const info = await (window as any).nexus?.getDisplayInfo?.();
+            const first = Array.isArray(info) && info[0] ? info[0] : { width: window.screen.width, height: window.screen.height };
+            speakAndSaveReply(`Tu pantalla principal tiene una resolución de ${first.width} por ${first.height} píxeles, Koko.`);
+            return;
+        }
+
+        const openNativeMatch = lower.match(/(?:abre|abrir|lanza|ejecuta)\s+(wireshark|burpsuite|burp suite|zaproxy|ghidra|vscode|visual studio code|spotify|firefox|chromium|thunar|nautilus|archivos|vlc|gimp|htop)\b/i);
+        if (openNativeMatch) {
+            const rawApp = openNativeMatch[1].toLowerCase().replace('burp suite', 'burpsuite').replace('visual studio code', 'vscode').replace('archivos', 'files');
+            const msg = (window as any).nexus?.openApp ? (window as any).nexus.openApp(rawApp) : `Abriendo ${rawApp}...`;
+            speakAndSaveReply(msg);
+            return;
+        }
+
+        const openWebMatch = lower.match(/(?:abre|abrir|navega a|ve a la web)\s+(youtube|google|github|shodan|exploit-db|kali\.org|wikipedia|[a-z0-9.-]+\.(?:com|org|net|es|io|ai|dev))\b/i);
+        if (openWebMatch) {
+            const siteMap: Record<string, string> = {
+                youtube: 'https://www.youtube.com',
+                google: 'https://www.google.com',
+                github: 'https://github.com',
+                shodan: 'https://www.shodan.io',
+                'exploit-db': 'https://www.exploit-db.com',
+                'kali.org': 'https://www.kali.org',
+                wikipedia: 'https://es.wikipedia.org',
+            };
+            const key = openWebMatch[1].toLowerCase();
+            const targetUrl = siteMap[key] || (key.startsWith('http') ? key : `https://${key}`);
+            (window as any).nexus?.openApp?.(targetUrl);
+            speakAndSaveReply(`Abriendo ${key} en tu navegador, Koko.`);
+            return;
+        }
+
+        // 11. Execute command in SystemTerminal ("ejecuta en la terminal ls -la", "corre el comando df -h")
+        const termCmdMatch = transcript.match(/^(?:nexus[, ]+)?(?:ejecuta en la terminal|ejecuta el comando|corre el comando|lanza en consola)\s+(.+)$/i);
+        if (termCmdMatch && termCmdMatch[1]) {
+            const cmdToRun = termCmdMatch[1].trim();
+            setTerminalInitialCmd(cmdToRun);
+            setShowTerminal(true);
+            speakAndSaveReply(`Ejecutando el comando "${cmdToRun}" en la terminal del sistema, Koko.`);
+            return;
+        }
+
+        // 12. Direct Web Search ("busca en internet...", "investiga sobre...")
+        const searchMatch = transcript.match(/^(?:nexus[, ]+)?(?:busca en internet|busca en la web|busca informaci[oó]n sobre|investiga sobre|busca en google)\s+(.+)$/i);
+        if (searchMatch && searchMatch[1]) {
+            const q = searchMatch[1].trim();
+            const searchRes = await getWebSearchResult(q);
+            const cleanSpeech = searchRes.replace(/\(Fuentes:[\s\S]*$/i, '').trim().slice(0, 380);
+            speakAndSaveReply(cleanSpeech);
+            return;
+        }
+
         const panelFeedback = matchAndApplyPanelCommand(transcript);
         if (panelFeedback) {
-            saveTranscript(panelFeedback, 'model');
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak(panelFeedback);
-            }
+            speakAndSaveReply(panelFeedback);
             return;
         }
 
