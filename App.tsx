@@ -171,6 +171,8 @@ export const App: React.FC = () => {
     const reconnectTimerRef = useRef<number | null>(null);
     const postToolTimerRef = useRef<number | null>(null);
     const autoStartedRef = useRef<boolean>(false);
+    const localVoiceBusyRef = useRef<boolean>(false);
+    const localGreetedRef = useRef<boolean>(false);
     const [typedCommandBuffer, setTypedCommandBuffer] = useState<string>('');
 
     const matchAndApplyPanelCommand = useCallback((rawInput: string): string | null => {
@@ -715,7 +717,7 @@ export const App: React.FC = () => {
                     }
                 }, fallbackDuration);
 
-                const playLinuxWavFallback = async () => {
+                const playLinuxWavFallback = async (): Promise<boolean> => {
                     try {
                         const res = await fetch('/api/local-tts', {
                             method: 'POST',
@@ -724,17 +726,36 @@ export const App: React.FC = () => {
                         });
                         if (!res.ok) return false;
                         const wavBuf = await res.arrayBuffer();
-                        const ctx = outputAudioContextRef.current;
-                        const analyser = outputAnalyserRef.current;
+                        if (!wavBuf || wavBuf.byteLength < 64) return false;
+
+                        let ctx = outputAudioContextRef.current;
+                        let analyser = outputAnalyserRef.current;
+                        if (!ctx || ctx.state === 'closed') {
+                            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+                            ctx = new AudioCtx();
+                            outputAudioContextRef.current = ctx;
+                            analyser = ctx.createAnalyser();
+                            analyser.fftSize = 256;
+                            analyser.connect(ctx.destination);
+                            outputAnalyserRef.current = analyser;
+                            setOutputAnalyser(analyser);
+                        }
                         if (ctx && analyser) {
-                            if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+                            if (ctx.state === 'suspended') {
+                                await ctx.resume().catch(() => {});
+                            }
                             const decoded = await ctx.decodeAudioData(wavBuf.slice(0));
                             const src = ctx.createBufferSource();
                             src.buffer = decoded;
                             src.connect(analyser);
+                            sourcesRef.current.add(src);
+                            setNexusStatus('SPEAKING');
                             src.onended = () => {
+                                sourcesRef.current.delete(src);
                                 clearTimeout(fallbackTimer);
-                                setNexusStatus('LISTENING');
+                                if (sourcesRef.current.size === 0) {
+                                    setNexusStatus('LISTENING');
+                                }
                             };
                             src.start(0);
                             return true;
@@ -743,13 +764,12 @@ export const App: React.FC = () => {
                     return false;
                 };
 
-                const playBrowserOrLinuxFallback = () => {
+                const playBrowserSpeechFallback = () => {
                     if ('speechSynthesis' in window) {
                         try {
                             window.speechSynthesis.cancel();
                             const voices = window.speechSynthesis.getVoices();
                             if (!voices || voices.length === 0) {
-                                playLinuxWavFallback();
                                 return;
                             }
                             const utterance = new SpeechSynthesisUtterance(cleanText);
@@ -770,17 +790,21 @@ export const App: React.FC = () => {
                                 clearTimeout(fallbackTimer);
                                 setNexusStatus('LISTENING');
                             };
-                            utterance.onerror = () => {
-                                playLinuxWavFallback();
-                            };
                             window.speechSynthesis.speak(utterance);
-                            return;
-                        } catch {
-                            playLinuxWavFallback();
-                        }
-                    } else {
-                        playLinuxWavFallback();
+                        } catch {}
                     }
+                };
+
+                const playBrowserOrLinuxFallback = () => {
+                    // Always prioritize /api/local-tts played through WebAudio (outputAudioContext -> outputAnalyser)
+                    // because it animates the Nexus visualizer wave and never hangs in Linux speech-dispatcher
+                    playLinuxWavFallback().then(played => {
+                        if (!played) {
+                            playBrowserSpeechFallback();
+                        }
+                    }).catch(() => {
+                        playBrowserSpeechFallback();
+                    });
                 };
 
                 // Always prioritize Nexus's fixed Kore voice via Gemini TTS when online
@@ -826,11 +850,13 @@ export const App: React.FC = () => {
         window.addEventListener('click', resumeAudio);
         window.addEventListener('touchstart', resumeAudio);
         window.addEventListener('pointerdown', resumeAudio);
+        window.addEventListener('mousemove', resumeAudio, { passive: true });
         window.addEventListener('keydown', resumeAudio);
         return () => {
             window.removeEventListener('click', resumeAudio);
             window.removeEventListener('touchstart', resumeAudio);
             window.removeEventListener('pointerdown', resumeAudio);
+            window.removeEventListener('mousemove', resumeAudio);
             window.removeEventListener('keydown', resumeAudio);
         };
     }, [playPcm24kChunk]);
@@ -1986,6 +2012,30 @@ export const App: React.FC = () => {
         const transcript = (rawText || '').trim();
         if (!transcript) return;
         console.log("Nexus command:", transcript);
+
+        // Allow Koko to paste or type a Gemini API Key (AIza...) directly on screen
+        const apiKeyMatch = transcript.match(/^(?:(?:nexus\s+)?apikey\s+)?(AIza[0-9A-Za-z_-]{30,})$/i);
+        if (apiKeyMatch && apiKeyMatch[1]) {
+            const newKey = apiKeyMatch[1].trim();
+            try {
+                localStorage.setItem('nexus_gemini_api_key', newKey);
+            } catch {}
+            try {
+                await fetch('/api/runtime-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ apiKey: newKey })
+                });
+            } catch {}
+            if ((window as any).nexus?.speak) {
+                (window as any).nexus.speak("¡De lujo, Koko! Clave Gemini guardada en tu sistema Linux. Conectando ahora mismo mi voz en tiempo real.");
+            }
+            setTimeout(() => {
+                window.dispatchEvent(new CustomEvent('nexus-reconnect'));
+            }, 400);
+            return;
+        }
+
         saveTranscript(transcript, 'user');
 
         const panelFeedback = matchAndApplyPanelCommand(transcript);
@@ -2203,10 +2253,11 @@ export const App: React.FC = () => {
             
             streamRef.current = stream;
 
-            // Initialize Audio Contexts
-            // Use 16k for input worklet, and native hardware rate for output to avoid ALSA/PulseAudio/PipeWire sample-rate conflicts
+            // Initialize Audio Contexts using native hardware sample rate so Firefox ESR & Chromium on Kali Linux
+            // (where PipeWire/ALSA mic streams run at 48kHz/44.1kHz) never throw sample-rate mismatch DOMExceptions!
+            // PCMProcessor automatically resamples from inputCtx.sampleRate down to 16000 Hz.
             const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-            const inputCtx = new AudioCtx({ sampleRate: 16000 });
+            const inputCtx = new AudioCtx();
             const outputCtx = new AudioCtx();
             
             inputAudioContextRef.current = inputCtx;
@@ -2297,104 +2348,239 @@ export const App: React.FC = () => {
                 return;
             }
 
-            // Now setup the audio processing pipeline safely
+            // Now setup the audio processing pipeline safely (AudioWorklet + ScriptProcessor fallback + Kali Linux VAD)
             const inputAudioContext = inputAudioContextRef.current;
             if (stream && inputAudioContext && stream.getAudioTracks().length > 0) {
+                const encodeWavFromChunks = (chunks: Int16Array[], sampleRate = 16000): string => {
+                    let totalSamples = 0;
+                    for (const c of chunks) totalSamples += c.length;
+                    const dataBytes = totalSamples * 2;
+                    const buffer = new ArrayBuffer(44 + dataBytes);
+                    const view = new DataView(buffer);
+                    const writeStr = (offset: number, s: string) => {
+                        for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+                    };
+                    writeStr(0, 'RIFF');
+                    view.setUint32(4, 36 + dataBytes, true);
+                    writeStr(8, 'WAVE');
+                    writeStr(12, 'fmt ');
+                    view.setUint32(16, 16, true);
+                    view.setUint16(20, 1, true); // PCM
+                    view.setUint16(22, 1, true); // Mono
+                    view.setUint32(24, sampleRate, true);
+                    view.setUint32(28, sampleRate * 2, true);
+                    view.setUint16(32, 2, true);
+                    view.setUint16(34, 16, true);
+                    writeStr(36, 'data');
+                    view.setUint32(40, dataBytes, true);
+                    let byteOffset = 44;
+                    for (const c of chunks) {
+                        for (let i = 0; i < c.length; i++) {
+                            view.setInt16(byteOffset, c[i], true);
+                            byteOffset += 2;
+                        }
+                    }
+                    return encode(new Uint8Array(buffer));
+                };
+
+                let preRollChunks: Int16Array[] = [];
+                let utteranceChunks: Int16Array[] = [];
+                let voicedChunksCount = 0;
+                let silenceChunksCount = 0;
+                let isCapturingUtterance = false;
+
+                const handleMicPcmChunk = (int16Data: Int16Array) => {
+                    const targetRate = 16000;
+                    let sumSq = 0;
+                    for (let k = 0; k < int16Data.length; k++) {
+                        const v = int16Data[k];
+                        sumSq += v * v;
+                    }
+                    const rmsInt16 = Math.sqrt(sumSq / int16Data.length);
+
+                    const isLocalMode = Boolean((sessionRef.current as any)?.isLocalSession);
+                    if (isLocalMode) {
+                        // In Kali Linux / Debian Local Mode, browser webkitSpeechRecognition is often unavailable
+                        // (Chromium lacks Google Speech API keys, Firefox ESR lacks SpeechRecognition).
+                        // Use real-time WebAudio VAD to capture Koko's voice utterances and process via /api/local-voice-turn.
+                        if (recognitionRef.current) return;
+                        const nexusCurrentlySpeaking =
+                            sourcesRef.current.size > 0 ||
+                            Boolean('speechSynthesis' in window && window.speechSynthesis.speaking);
+                        if (nexusCurrentlySpeaking || localVoiceBusyRef.current) {
+                            isCapturingUtterance = false;
+                            utteranceChunks = [];
+                            voicedChunksCount = 0;
+                            silenceChunksCount = 0;
+                            return;
+                        }
+
+                        const VOICE_THRESHOLD = 420;
+                        if (rmsInt16 >= VOICE_THRESHOLD) {
+                            if (!isCapturingUtterance) {
+                                isCapturingUtterance = true;
+                                utteranceChunks = [...preRollChunks];
+                                voicedChunksCount = 0;
+                            }
+                            utteranceChunks.push(int16Data);
+                            voicedChunksCount++;
+                            silenceChunksCount = 0;
+                        } else if (isCapturingUtterance) {
+                            utteranceChunks.push(int16Data);
+                            silenceChunksCount++;
+                        } else {
+                            preRollChunks.push(int16Data);
+                            if (preRollChunks.length > 3) preRollChunks.shift();
+                        }
+
+                        if (isCapturingUtterance && (silenceChunksCount >= 6 || utteranceChunks.length >= 80)) {
+                            const captured = utteranceChunks;
+                            const voiced = voicedChunksCount;
+                            isCapturingUtterance = false;
+                            utteranceChunks = [];
+                            voicedChunksCount = 0;
+                            silenceChunksCount = 0;
+
+                            if (voiced >= 3) {
+                                localVoiceBusyRef.current = true;
+                                setNexusStatus('THINKING');
+                                const audioWavBase64 = encodeWavFromChunks(captured, targetRate);
+                                fetch('/api/local-voice-turn', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ audioWavBase64 }),
+                                })
+                                    .then(r => (r.ok ? r.json() : null))
+                                    .then(async (data) => {
+                                        if (data?.transcript && String(data.transcript).trim()) {
+                                            await processLocalCommand(String(data.transcript).trim());
+                                        } else if (data?.reply) {
+                                            saveTranscript(data.reply, 'model');
+                                            if ((window as any).nexus?.speak) {
+                                                (window as any).nexus.speak(data.reply);
+                                            }
+                                        } else {
+                                            setNexusStatus('LISTENING');
+                                        }
+                                    })
+                                    .catch(() => {
+                                        setNexusStatus('LISTENING');
+                                    })
+                                    .finally(() => {
+                                        localVoiceBusyRef.current = false;
+                                    });
+                            }
+                        }
+                        return;
+                    }
+
+                    // Cloud Gemini Live mode: prevent speaker echo from self-interrupting Nexus while she is speaking,
+                    // while still allowing Koko to barge-in when speaking directly into the mic
+                    let payloadBuffer = int16Data;
+                    if (sourcesRef.current.size > 0) {
+                        if (rmsInt16 >= 2200) {
+                            lastUserBargeInRef.current = Date.now();
+                        } else {
+                            payloadBuffer = new Int16Array(int16Data.length);
+                        }
+                    }
+
+                    const pcmBlob = {
+                        data: encode(new Uint8Array(payloadBuffer.buffer)),
+                        mimeType: `audio/pcm;rate=${targetRate}`,
+                    };
+
+                    if (sessionPromiseRef.current) {
+                        sessionPromiseRef.current.then(session => {
+                            session.sendRealtimeInput({ audio: pcmBlob });
+                        }).catch(() => {});
+                    }
+                };
+
                 try {
                     const source = inputAudioContext.createMediaStreamSource(stream);
                     const inputAnalyserNode = inputAudioContext.createAnalyser();
                     inputAnalyserNode.fftSize = 512;
                     setInputAnalyser(inputAnalyserNode);
-
-                    const workletCode = `
-                    class PCMProcessor extends AudioWorkletProcessor {
-                        constructor(options) {
-                            super();
-                            this.sourceRate = options.processorOptions.sampleRate;
-                            this.targetRate = 16000;
-                            this.ratio = this.sourceRate / this.targetRate;
-                            this.bufferSize = 2048;
-                            this.outBuffer = new Int16Array(this.bufferSize);
-                            this.outBufferIndex = 0;
-                            this.inputOffset = 0;
-                        }
-                        process(inputs, outputs, parameters) {
-                            const input = inputs[0];
-                            if (input && input.length > 0 && input[0]) {
-                                const channelData = input[0];
-                                let i = this.inputOffset;
-                                while (Math.floor(i) < channelData.length) {
-                                    const index = Math.floor(i);
-                                    const s = Math.max(-1, Math.min(1, channelData[index]));
-                                    this.outBuffer[this.outBufferIndex++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                                    
-                                    if (this.outBufferIndex >= this.bufferSize) {
-                                        this.port.postMessage(this.outBuffer.slice());
-                                        this.outBufferIndex = 0;
-                                    }
-                                    
-                                    i += this.ratio;
-                                }
-                                
-                                this.inputOffset = i - channelData.length;
-                            }
-                            return true;
-                        }
-                    }
-                    registerProcessor('pcm-processor', PCMProcessor);
-                    `;
-                    const blob = new Blob([workletCode], { type: 'application/javascript' });
-                    const url = URL.createObjectURL(blob);
-                    
-                    await inputAudioContext.audioWorklet.addModule(url);
-                    const workletNode = new AudioWorkletNode(inputAudioContext, 'pcm-processor', {
-                        processorOptions: {
-                            sampleRate: inputAudioContext.sampleRate
-                        }
-                    });
-                    
-                    audioWorkletRef.current = workletNode;
-
-                    workletNode.port.onmessage = (e) => {
-                        const int16Data = e.data as Int16Array;
-                        const targetRate = 16000;
-
-                        // Prevent speaker echo from self-interrupting Nexus while she is speaking,
-                        // while still allowing Koko to barge-in when speaking directly into the mic
-                        let payloadBuffer = int16Data;
-                        if (sourcesRef.current.size > 0) {
-                            let sumSq = 0;
-                            for (let k = 0; k < int16Data.length; k++) {
-                                const v = int16Data[k];
-                                sumSq += v * v;
-                            }
-                            const rmsInt16 = Math.sqrt(sumSq / int16Data.length);
-                            if (rmsInt16 >= 2200) {
-                                lastUserBargeInRef.current = Date.now();
-                            } else {
-                                payloadBuffer = new Int16Array(int16Data.length);
-                            }
-                        }
-                        
-                        const pcmBlob = {
-                            data: encode(new Uint8Array(payloadBuffer.buffer)),
-                            mimeType: `audio/pcm;rate=${targetRate}`,
-                        };
-                        
-                        if (sessionPromiseRef.current) {
-                            sessionPromiseRef.current.then(session => {
-                                session.sendRealtimeInput({ audio: pcmBlob });
-                            }).catch(() => {});
-                        }
-                    };
-                    
                     source.connect(inputAnalyserNode);
-                    inputAnalyserNode.connect(workletNode);
-                    
-                    const gainNode = inputAudioContext.createGain();
-                    gainNode.gain.setValueAtTime(0, inputAudioContext.currentTime);
-                    workletNode.connect(gainNode);
-                    gainNode.connect(inputAudioContext.destination);
+
+                    try {
+                        const workletCode = `
+                        class PCMProcessor extends AudioWorkletProcessor {
+                            constructor(options) {
+                                super();
+                                this.sourceRate = (options && options.processorOptions && options.processorOptions.sampleRate) || sampleRate || 48000;
+                                this.targetRate = 16000;
+                                this.ratio = this.sourceRate / this.targetRate;
+                                this.bufferSize = 2048;
+                                this.outBuffer = new Int16Array(this.bufferSize);
+                                this.outBufferIndex = 0;
+                                this.inputOffset = 0;
+                            }
+                            process(inputs) {
+                                const input = inputs[0];
+                                if (input && input.length > 0 && input[0]) {
+                                    const channelData = input[0];
+                                    let i = this.inputOffset;
+                                    while (Math.floor(i) < channelData.length) {
+                                        const index = Math.floor(i);
+                                        const s = Math.max(-1, Math.min(1, channelData[index]));
+                                        this.outBuffer[this.outBufferIndex++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                        if (this.outBufferIndex >= this.bufferSize) {
+                                            this.port.postMessage(this.outBuffer.slice());
+                                            this.outBufferIndex = 0;
+                                        }
+                                        i += this.ratio;
+                                    }
+                                    this.inputOffset = i - channelData.length;
+                                }
+                                return true;
+                            }
+                        }
+                        registerProcessor('pcm-processor', PCMProcessor);
+                        `;
+                        const blob = new Blob([workletCode], { type: 'application/javascript' });
+                        const url = URL.createObjectURL(blob);
+
+                        await inputAudioContext.audioWorklet.addModule(url);
+                        const workletNode = new AudioWorkletNode(inputAudioContext, 'pcm-processor', {
+                            processorOptions: {
+                                sampleRate: inputAudioContext.sampleRate
+                            }
+                        });
+
+                        audioWorkletRef.current = workletNode;
+                        workletNode.port.onmessage = (e) => {
+                            handleMicPcmChunk(e.data as Int16Array);
+                        };
+
+                        inputAnalyserNode.connect(workletNode);
+                        const gainNode = inputAudioContext.createGain();
+                        gainNode.gain.setValueAtTime(0, inputAudioContext.currentTime);
+                        workletNode.connect(gainNode);
+                        gainNode.connect(inputAudioContext.destination);
+                    } catch (workletErr) {
+                        // Fallback to ScriptProcessorNode if AudioWorklet blob is blocked or unsupported
+                        const scriptNode = inputAudioContext.createScriptProcessor(4096, 1, 1);
+                        const sourceRate = inputAudioContext.sampleRate || 48000;
+                        const ratio = sourceRate / 16000;
+                        scriptNode.onaudioprocess = (ev) => {
+                            const channelData = ev.inputBuffer.getChannelData(0);
+                            const outLen = Math.floor(channelData.length / ratio);
+                            const out = new Int16Array(outLen);
+                            for (let j = 0; j < outLen; j++) {
+                                const s = Math.max(-1, Math.min(1, channelData[Math.floor(j * ratio)]));
+                                out[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                            }
+                            handleMicPcmChunk(out);
+                        };
+                        inputAnalyserNode.connect(scriptNode);
+                        const gainNode = inputAudioContext.createGain();
+                        gainNode.gain.setValueAtTime(0, inputAudioContext.currentTime);
+                        scriptNode.connect(gainNode);
+                        gainNode.connect(inputAudioContext.destination);
+                        audioWorkletRef.current = scriptNode as any;
+                    }
                 } catch (audioPipeErr) {
                     console.warn("Audio input pipeline warning (continuing in active session):", audioPipeErr);
                 }
@@ -2405,6 +2591,14 @@ export const App: React.FC = () => {
             if ((sessionRef.current as any)?.isLocalSession) {
                 setLastError(null);
                 startOfflineRecognition();
+                if (!localGreetedRef.current) {
+                    localGreetedRef.current = true;
+                    setTimeout(() => {
+                        if ((window as any).nexus?.speak) {
+                            (window as any).nexus.speak("¡Ya estoy aquí en tu Kali Linux, Koko! Te escucho alto y claro.");
+                        }
+                    }, 350);
+                }
             }
 
         } catch (error: any) {
@@ -2543,8 +2737,27 @@ export const App: React.FC = () => {
                 setTypedCommandBuffer(prev => (prev + e.key).slice(0, 160));
             }
         };
+        const handlePaste = (e: ClipboardEvent) => {
+            const activeEl = document.activeElement;
+            const tag = activeEl?.tagName?.toLowerCase();
+            if (tag === 'input' || tag === 'textarea' || (activeEl as HTMLElement)?.isContentEditable) {
+                return;
+            }
+            const pasted = (e.clipboardData?.getData('text') || '').trim();
+            if (!pasted) return;
+            if (/^(?:(?:nexus\s+)?apikey\s+)?AIza[0-9A-Za-z_-]{30,}$/i.test(pasted)) {
+                e.preventDefault();
+                processLocalCommand(pasted);
+            } else {
+                setTypedCommandBuffer(prev => `${prev}${pasted}`.slice(0, 160));
+            }
+        };
         window.addEventListener('keydown', handleKeyDown);
-        return () => window.removeEventListener('keydown', handleKeyDown);
+        window.addEventListener('paste', handlePaste);
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown);
+            window.removeEventListener('paste', handlePaste);
+        };
     }, [hasGrantedAccess, processLocalCommand]);
 
     useEffect(() => {

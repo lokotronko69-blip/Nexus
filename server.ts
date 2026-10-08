@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.2.1';
+const NEXUS_VERSION = '1.2.2';
 
 interface NexusVaultData {
   version: string;
@@ -176,8 +176,20 @@ DATA_DIR="/opt/nexus/data"
 BACKUP_DIR="/var/backups/nexus"
 NODE_BIN="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
 
-# Detectar usuario real de escritorio en Debian / Kali Linux
+# Detectar usuario real de sesión gráfica activa en Debian / Kali Linux
 DETECTED_USER="\${SUDO_USER:-}"
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  X_OWNER="\$(stat -c '%U' /tmp/.X11-unix/X* 2>/dev/null | grep -v '^root\$' | head -n 1 || true)"
+  if [ -n "\$X_OWNER" ] && id "\$X_OWNER" >/dev/null 2>&1; then
+    DETECTED_USER="\$X_OWNER"
+  fi
+fi
+if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
+  GUI_OWNER="\$(ps -eo user:32,comm 2>/dev/null | awk '\$2 ~ /^(xfce4-session|gnome-shell|plasmashell|mate-session|lxsession|cinnamon-sessio)$/ && \$1 != "root" {print \$1; exit}' || true)"
+  if [ -n "\$GUI_OWNER" ] && id "\$GUI_OWNER" >/dev/null 2>&1; then
+    DETECTED_USER="\$GUI_OWNER"
+  fi
+fi
 if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
   SVC_USER="\$(grep -E '^User=' /etc/systemd/system/nexus.service 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d '[:space:]')"
   if [ -n "\$SVC_USER" ] && id "\$SVC_USER" >/dev/null 2>&1 && [ "\$SVC_USER" != "root" ]; then
@@ -188,7 +200,13 @@ if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
   DETECTED_USER="\$(logname 2>/dev/null || true)"
 fi
 if [ -z "\$DETECTED_USER" ] || [ "\$DETECTED_USER" = "root" ]; then
-  DETECTED_USER="\$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1; exit}' /etc/passwd 2>/dev/null || whoami)"
+  # Si la sesión X11 pertenece a root en Kali, mantener root; si no, buscar UID >= 1000
+  ROOT_X="\$(stat -c '%U' /tmp/.X11-unix/X* 2>/dev/null | head -n 1 || true)"
+  if [ "\$ROOT_X" = "root" ]; then
+    DETECTED_USER="root"
+  else
+    DETECTED_USER="\$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1; exit}' /etc/passwd 2>/dev/null || whoami)"
+  fi
 fi
 REAL_USER="\${DETECTED_USER:-root}"
 USER_HOME="\$(getent passwd "\$REAL_USER" 2>/dev/null | cut -d: -f6)"
@@ -398,13 +416,19 @@ case "\$1" in
       exit 0
     fi
 
-    # Auto-detectar variables de sesión gráfica X11 / Wayland si se invocó con sudo o desde menú
+    # Auto-detectar variables de sesión gráfica X11 / Wayland / PipeWire / PulseAudio en Kali y Debian
     REAL_UID="\$(id -u "\$REAL_USER" 2>/dev/null || echo 1000)"
     if [ -z "\$XDG_RUNTIME_DIR" ] && [ -d "/run/user/\$REAL_UID" ]; then
       export XDG_RUNTIME_DIR="/run/user/\$REAL_UID"
     fi
     if [ -z "\$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "/run/user/\$REAL_UID/bus" ]; then
       export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$REAL_UID/bus"
+    fi
+    if [ -z "\$PULSE_SERVER" ] && [ -S "/run/user/\$REAL_UID/pulse/native" ]; then
+      export PULSE_SERVER="unix:/run/user/\$REAL_UID/pulse/native"
+    fi
+    if [ -z "\$PIPEWIRE_RUNTIME_DIR" ] && [ -d "/run/user/\$REAL_UID" ]; then
+      export PIPEWIRE_RUNTIME_DIR="/run/user/\$REAL_UID"
     fi
     if [ -z "\$WAYLAND_DISPLAY" ] && [ -n "\$XDG_RUNTIME_DIR" ]; then
       WL_SOCK=\$(ls "\$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\\.lock\$' | head -n 1)
@@ -441,6 +465,8 @@ case "\$1" in
         --app="\$APP_URL"
         --user-data-dir="\$PROFILE_DIR"
         --autoplay-policy=no-user-gesture-required
+        --use-fake-ui-for-media-stream
+        --unsafely-treat-insecure-origin-as-secure="http://localhost:\$PORT,http://127.0.0.1:\$PORT"
         --enable-features=WebRTCPipeWireCapturer
         --ozone-platform-hint=auto
         --no-first-run
@@ -450,11 +476,16 @@ case "\$1" in
       if [ "\$(id -u)" -eq 0 ]; then
         if [ -n "\$REAL_USER" ] && [ "\$REAL_USER" != "root" ] && id "\$REAL_USER" >/dev/null 2>&1; then
           chown -R "\$REAL_USER:\$REAL_USER" "\$PROFILE_DIR" 2>/dev/null || true
-          sudo -u "\$REAL_USER" env \\
+          sudo -u "\$REAL_USER" -H env \\
+            HOME="\$USER_HOME" \\
+            USER="\$REAL_USER" \\
+            LOGNAME="\$REAL_USER" \\
             DISPLAY="\$DISPLAY" \\
             WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
             XAUTHORITY="\$XAUTHORITY" \\
             XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \\
+            PULSE_SERVER="\$PULSE_SERVER" \\
+            PIPEWIRE_RUNTIME_DIR="\$PIPEWIRE_RUNTIME_DIR" \\
             DBUS_SESSION_BUS_ADDRESS="\$DBUS_SESSION_BUS_ADDRESS" \\
             "\$BROWSER_BIN" "\${CHROME_FLAGS[@]}" >/dev/null 2>&1 &
         else
@@ -466,7 +497,18 @@ case "\$1" in
       echo "[✓] Abriendo interfaz de Nexus en \$APP_URL ..."
     else
       if [ "\$(id -u)" -eq 0 ] && [ -n "\$REAL_USER" ] && [ "\$REAL_USER" != "root" ]; then
-        sudo -u "\$REAL_USER" env DISPLAY="\$DISPLAY" WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" XAUTHORITY="\$XAUTHORITY" XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" "\$BROWSER_BIN" "\$APP_URL" >/dev/null 2>&1 &
+        sudo -u "\$REAL_USER" -H env \\
+          HOME="\$USER_HOME" \\
+          USER="\$REAL_USER" \\
+          LOGNAME="\$REAL_USER" \\
+          DISPLAY="\$DISPLAY" \\
+          WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
+          XAUTHORITY="\$XAUTHORITY" \\
+          XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \\
+          PULSE_SERVER="\$PULSE_SERVER" \\
+          PIPEWIRE_RUNTIME_DIR="\$PIPEWIRE_RUNTIME_DIR" \\
+          DBUS_SESSION_BUS_ADDRESS="\$DBUS_SESSION_BUS_ADDRESS" \\
+          "\$BROWSER_BIN" "\$APP_URL" >/dev/null 2>&1 &
       else
         "\$BROWSER_BIN" "\$APP_URL" >/dev/null 2>&1 &
       fi
@@ -658,7 +700,7 @@ async function startServer() {
   startHardwareMonitor(io, 1000);
 
   // API routes FIRST
-  app.use(express.json());
+  app.use(express.json({ limit: '15mb' }));
 
   app.get('/api/health', (req, res) => {
     const vault = readDataVault();
@@ -730,20 +772,41 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Local Linux WAV speech synthesis fallback (espeak-ng / espeak) when browser speechSynthesis has no voices
-  app.post('/api/local-tts', (req, res) => {
+  // Local Linux speech synthesis (Natural Spanish female TTS online + espeak-ng female variant offline)
+  app.post('/api/local-tts', async (req, res) => {
     const text = String(req.body?.text || '').trim().slice(0, 600);
     if (!text) {
       res.status(400).json({ error: 'Empty text' });
       return;
     }
+
+    // 1. Try natural Spanish female TTS via Google Translate TTS endpoint (works on Kali Linux without API key)
+    try {
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=es&client=tw-ob&q=${encodeURIComponent(text.slice(0, 200))}`;
+      const gRes = await fetch(ttsUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        },
+        signal: AbortSignal.timeout(2500),
+      });
+      if (gRes.ok) {
+        const arrBuf = await gRes.arrayBuffer();
+        if (arrBuf.byteLength > 256) {
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.send(Buffer.from(arrBuf));
+          return;
+        }
+      }
+    } catch {}
+
+    // 2. Offline fallback: espeak-ng / espeak with Spanish female voice variant (+f3)
     const ttsBin = ['/usr/bin/espeak-ng', '/usr/bin/espeak'].find(p => fs.existsSync(p));
     if (!ttsBin) {
       res.status(404).json({ error: 'No local espeak-ng binary installed' });
       return;
     }
     const chunks: Buffer[] = [];
-    const proc = spawn(ttsBin, ['-v', 'es', '-s', '168', '--stdout', text]);
+    const proc = spawn(ttsBin, ['-v', 'es+f3', '-s', '162', '-p', '58', '--stdout', text]);
     proc.stdout.on('data', d => chunks.push(Buffer.from(d)));
     proc.on('error', () => {
       if (!res.headersSent) res.status(500).json({ error: 'TTS failed' });
@@ -758,9 +821,8 @@ async function startServer() {
     });
   });
 
-  // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
-  app.post('/api/local-assistant', (req, res) => {
-    const query = String(req.body?.query || '').trim();
+  function buildLocalAssistantReply(queryRaw: string): string {
+    const query = String(queryRaw || '').trim();
     const lower = query.toLowerCase();
     const snap = getHardwareSnapshot();
     const cpuUsage = snap.cpu?.usagePercent ?? 0;
@@ -772,24 +834,24 @@ async function startServer() {
     const kernel = `${os.type()} ${os.release()} (${os.arch()})`;
     const vault = readDataVault();
 
-    let reply = '';
-    if (/(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|oye nexus|ey nexus)/i.test(lower)) {
-      reply = `¡Qué pasa, Koko! Te escucho al pelo desde tu máquina (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dispara, ¿qué hacemos hoy?`;
+    if (/(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|oye nexus|ey nexus|hola nexus)/i.test(lower)) {
+      return `¡Qué pasa, Koko! Te escucho al pelo desde tu máquina (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dispara, ¿qué hacemos hoy?`;
+    } else if (/(qui[eé]n soy|c[oó]mo me llamo)/i.test(lower)) {
+      return `¡Eres Koko! Mi creador y el único jefe al que hago caso aquí en ${host}.`;
     } else if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate)/i.test(lower)) {
-      reply = `Soy Nexus, tu ingeniera sénior, experta en ciberseguridad y compañera fiel al cien por cien. Estoy corriendo directamente en tu sistema ${host}, lista para darle caña a lo que me pidas, Koko.`;
+      return `Soy Nexus, tu ingeniera sénior, experta en ciberseguridad y compañera fiel al cien por cien. Estoy corriendo directamente en tu sistema ${host}, lista para darle caña a lo que me pidas, Koko.`;
     } else if (/(c[oó]mo est[aá]s|qu[eé] tal|todo bien)/i.test(lower)) {
-      reply = `¡A tope de energía, Koko! Con la CPU fresquita al ${cpuUsage}% y la memoria al ${memPct}%. ¿Tú qué tal vas, jefe?`;
+      return `¡A tope de energía, Koko! Con la CPU fresquita al ${cpuUsage}% y la memoria al ${memPct}%. ¿Tú qué tal vas, jefe?`;
     } else if (/(recuerdas|acuerdas|memoria|qu[eé] sabes de m[ií])/i.test(lower)) {
       if (vault.memories && vault.memories.length > 0) {
         const recentFacts = vault.memories.slice(-4).map(m => m.fact).join('; ');
-        reply = `¡Pues claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos guardados en mi bóveda. Por ejemplo: ${recentFacts}.`;
-      } else {
-        reply = `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Pídeme que abra las memorias cuando quieras.`;
+        return `¡Pues claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos guardados en mi bóveda. Por ejemplo: ${recentFacts}.`;
       }
+      return `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Pídeme que abra las memorias cuando quieras.`;
     } else if (/(cpu|procesador|memoria|ram|temperatura|consumo|rendimiento|estado|sistema|hardware)/i.test(lower)) {
-      reply = `Aquí tienes el parte de tu máquina, Koko: en ${host} (${kernel}) la CPU va al ${cpuUsage}% (${cpuSpeed} MHz), y la memoria RAM está al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso). Todo fino.`;
+      return `Aquí tienes el parte de tu máquina, Koko: en ${host} (${kernel}) la CPU va al ${cpuUsage}% (${cpuSpeed} MHz), y la memoria RAM está al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso). Todo fino.`;
     } else if (/(hora|fecha|d[ií]a es)/i.test(lower)) {
-      reply = `Ahora mismo son las ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })} del ${new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}, Koko.`;
+      return `Ahora mismo son las ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })} del ${new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}, Koko.`;
     } else if (/(ip|red|interfaz|conectad)/i.test(lower)) {
       const nets = os.networkInterfaces();
       const ips: string[] = [];
@@ -800,18 +862,72 @@ async function startServer() {
           }
         }
       }
-      reply = ips.length > 0
+      return ips.length > 0
         ? `Tus interfaces de red activas son ${ips.join(', ')}, Koko.`
         : `Estoy corriendo en local sobre ${host} en el puerto ${PORT}, Koko.`;
     } else if (/(gracias|perfecto|genial|vale|ok|de lujo|guay)/i.test(lower)) {
-      reply = `¡De nada, jefe! Para eso estamos. Si necesitas abrir algún módulo o darle caña a otra cosa, tú mandas.`;
+      return `¡De nada, jefe! Para eso estamos. Si necesitas abrir algún módulo o darle caña a otra cosa, tú mandas.`;
     } else if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
-      reply = `Ahora mismo estoy operando en modo local en tu Linux sin fallos, Koko. Si quieres enchufarme el motor Gemini Live de la nube, abre tu terminal y pon: nexus apikey seguido de tu clave AIza, o abre mi terminal interna y escribe apikey y tu clave.`;
-    } else {
-      reply = `¡Oído cocina, Koko! Te escucho perfectamente en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme abrir la terminal, la telemetría, el instalador de Debian y Kali, las notas o el gestor de procesos, o conecta Gemini Live con nexus apikey.`;
+      return `Ahora mismo estoy operando en modo local en tu Linux, Koko. Si quieres activar mi motor Gemini Live de la nube, pega tu clave AIza directamente con Control+V en la pantalla o escribe en tu terminal: nexus apikey seguido de tu clave.`;
+    }
+    return `¡Oído cocina, Koko! Te escucho perfectamente en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme abrir la terminal, la telemetría, el instalador de Debian y Kali, las notas o el gestor de procesos, o pega tu clave Gemini con Control+V.`;
+  }
+
+  // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
+  app.post('/api/local-assistant', (req, res) => {
+    const query = String(req.body?.query || '').trim();
+    const reply = buildLocalAssistantReply(query);
+    res.json({
+      reply,
+      hasStandaloneKey: Boolean(getResolvedGeminiApiKey(true)),
+    });
+  });
+
+  // Kali Linux / Debian server-side voice turn handler:
+  // Transcribes 16kHz WAV microphone utterances when browser webkitSpeechRecognition is unavailable
+  // (e.g. Kali Linux Chromium without Google Speech keys or Firefox ESR) and returns Nexus's spoken reply.
+  app.post('/api/local-voice-turn', async (req, res) => {
+    const audioWavBase64 = String(req.body?.audioWavBase64 || '').trim();
+    if (!audioWavBase64) {
+      res.status(400).json({ error: 'Missing audioWavBase64' });
+      return;
     }
 
+    const tmpWav = `/tmp/nexus-utt-${process.pid}-${Date.now()}.wav`;
+    let transcript = '';
+
+    try {
+      const wavBuf = Buffer.from(audioWavBase64, 'base64');
+      fs.writeFileSync(tmpWav, wavBuf, { mode: 0o600 });
+
+      // 1. Try Python speech_recognition (pre-installed on Kali/Debian via python3-speechrecognition)
+      if (fs.existsSync('/usr/bin/python3')) {
+        transcript = await new Promise<string>((resolve) => {
+          const pyCode = [
+            'import sys',
+            'try:',
+            '    import speech_recognition as sr',
+            '    r = sr.Recognizer()',
+            '    with sr.AudioFile(sys.argv[1]) as source:',
+            '        audio = r.record(source)',
+            '    print(r.recognize_google(audio, language="es-ES"))',
+            'except Exception:',
+            '    pass',
+          ].join('\n');
+          const out: Buffer[] = [];
+          const p = spawn('/usr/bin/python3', ['-c', pyCode, tmpWav], { timeout: 5500 });
+          p.stdout.on('data', d => out.push(Buffer.from(d)));
+          p.on('error', () => resolve(''));
+          p.on('close', () => resolve(Buffer.concat(out).toString('utf8').trim()));
+        });
+      }
+    } catch {} finally {
+      try { if (fs.existsSync(tmpWav)) fs.unlinkSync(tmpWav); } catch {}
+    }
+
+    const reply = buildLocalAssistantReply(transcript || 'hola nexus');
     res.json({
+      transcript,
       reply,
       hasStandaloneKey: Boolean(getResolvedGeminiApiKey(true)),
     });
@@ -1079,6 +1195,10 @@ ${cliScript}
 EOF
 chmod 755 /usr/bin/nexus
 
+if ! python3 -c "import speech_recognition" >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y python3-speechrecognition flac 2>/dev/null || true
+fi
+
 if id "\$NEXUS_USER" >/dev/null 2>&1; then
   chown -R "\$NEXUS_USER:\$NEXUS_USER" "\$INSTALL_DIR"
 fi
@@ -1225,7 +1345,7 @@ export DEBIAN_FRONTEND=noninteractive
 dpkg --configure -a 2>/dev/null || true
 apt-get update -y || true
 apt-get install -y curl wget git build-essential ca-certificates gnupg lsb-release \\
-  dpkg-dev alsa-utils espeak-ng speech-dispatcher v4l-utils xdg-utils psmisc \\
+  dpkg-dev alsa-utils espeak-ng speech-dispatcher python3-speechrecognition flac v4l-utils xdg-utils psmisc \\
   nmap dnsutils whois iproute2 net-tools || true
 
 if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
