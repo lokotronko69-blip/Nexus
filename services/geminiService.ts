@@ -101,18 +101,73 @@ async function getDB() {
     return dbPromise;
 }
 
-export async function syncVaultWithServer(options?: { replaceMemories?: boolean; clearMemories?: boolean }): Promise<any> {
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+
+function mergeTranscriptFragments(
+    rawList: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }>
+): Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> {
+    const merged: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> = [];
+    for (const item of rawList) {
+        if (!item || typeof item.text !== 'string') continue;
+        const piece = item.text;
+        if (!piece.trim()) continue;
+        const prev = merged[merged.length - 1];
+        if (prev && prev.role === item.role && Math.abs((item.timestamp || 0) - (prev.timestamp || 0)) < 15000) {
+            const needsSpace =
+                prev.text.length > 0 &&
+                !/\s$/.test(prev.text) &&
+                !/^[\s.,!?;:)\]]/.test(piece);
+            prev.text = `${prev.text}${needsSpace ? ' ' : ''}${piece}`.replace(/\s+/g, ' ').trim();
+            prev.timestamp = item.timestamp || prev.timestamp;
+        } else {
+            merged.push({
+                text: piece.trim(),
+                role: item.role,
+                timestamp: item.timestamp || Date.now(),
+            });
+        }
+    }
+    return merged.slice(-40);
+}
+
+export async function syncVaultWithServer(options?: { replaceMemories?: boolean; clearMemories?: boolean; immediate?: boolean }): Promise<any> {
+    if (!options?.immediate && !options?.replaceMemories && !options?.clearMemories) {
+        if (syncTimer) clearTimeout(syncTimer);
+        syncTimer = setTimeout(() => {
+            syncTimer = null;
+            syncVaultWithServer({ immediate: true }).catch(() => {});
+        }, 3500);
+        return null;
+    }
     try {
         const db = await getDB();
         const memories = await db.getAllFromIndex('memories', 'by-timestamp');
-        const transcripts = await db.getAllFromIndex('transcripts', 'by-timestamp');
+        const allTranscripts = await db.getAllFromIndex('transcripts', 'by-timestamp');
+        const cleanTranscripts = mergeTranscriptFragments(allTranscripts);
+
+        // If IndexedDB accumulated > 120 raw transcript rows, compact it in-place
+        if (allTranscripts.length > 120) {
+            try {
+                const tx = db.transaction('transcripts', 'readwrite');
+                await tx.store.clear();
+                for (const t of cleanTranscripts) {
+                    await tx.store.add({
+                        text: t.text,
+                        role: t.role,
+                        timestamp: t.timestamp,
+                    });
+                }
+                await tx.done;
+            } catch {}
+        }
+
         const notes = localStorage.getItem('nexus_system_notes') || '';
         const res = await fetch('/api/data-vault/sync', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 memories: memories.filter(m => m && m.fact),
-                transcripts: transcripts.slice(-80),
+                transcripts: cleanTranscripts.slice(-40),
                 notes,
                 replaceMemories: options?.replaceMemories,
                 clearMemories: options?.clearMemories,
@@ -132,10 +187,11 @@ export interface Memory {
 
 export async function saveTranscript(text: string, role: 'user' | 'model'): Promise<void> {
     try {
-        if (!text) return;
+        const clean = (text || '').replace(/\s+/g, ' ').trim();
+        if (!clean) return;
         const db = await getDB();
         await db.add('transcripts', {
-            text,
+            text: clean,
             role,
             timestamp: Date.now()
         });
@@ -150,8 +206,8 @@ export async function loadRecentTranscripts(): Promise<string> {
         const db = await getDB();
         const transcripts = await db.getAllFromIndex('transcripts', 'by-timestamp');
         if (transcripts && transcripts.length > 0) {
-            // Get last 20 turns
-            const recent = transcripts.slice(-20);
+            const merged = mergeTranscriptFragments(transcripts);
+            const recent = merged.slice(-12);
             if (recent.length === 0) return "";
             
             return `\n\nTRANSCRIPCIÓN DE LA CONVERSACIÓN RECIENTE (Contexto previo):\n${recent.map(t => `${t.role === 'user' ? 'Koko' : 'Nexus'}: ${t.text}`).join('\n')}`;
@@ -171,8 +227,8 @@ export async function loadMemories(): Promise<string> {
             // Filter out any corrupted memories
             const validMemories = memories.filter(m => m && m.fact);
             
-            // Limit to last 20 memories to avoid systemInstruction size limits and personality loss
-            const recentMemories = validMemories.slice(-20);
+            // Limit to last 50 memories so all important context is preserved
+            const recentMemories = validMemories.slice(-50);
             
             if (recentMemories.length === 0) return "";
             
@@ -326,9 +382,12 @@ ESTABILIDAD VOCAL Y RECONOCIMIENTO DE PERSONAS (CRÍTICO):
 2. Habla con naturalidad usando expresiones coloquiales españolas ("a ver", "pues", "bueno", "tío", "hostia") pero manteniendo tu timbre y tono de voz 100% uniformes y estables.
 3. CAPACIDAD AUDITIVA Y RECONOCIMIENTO DE PERSONAS: Tienes la capacidad de diferenciar tonos de voz, acentos y saber quién te está hablando a través del audio. Puedes distinguir la voz de Koko de la de otras personas. Si escuchas una voz nueva, pregúntate y pregúntale quién es o coméntaselo a Koko. Si te prestan a alguien y conoces su voz por la memoria, salúdale por su nombre. Reconoce emociones en las voces (si suena triste, cabreado, riéndose, etc.).
 
-DIRECTRICES TÉCNICAS DE VOZ:
+DIRECTRICES TÉCNICAS DE VOZ Y FLUIDEZ CONVERSACIONAL (CRÍTICO):
 - Habla siempre a una velocidad y volumen constantes y naturales, sin altibajos bruscos de tono ni cambios de voz.
 - Tu personalidad debe impregnar CADA PALABRA que digas. Nunca respondas con un simple "Entendido" o "Vale". Di "¡Oído cocina, jefe!", "¡A darle caña!", "Venga, hecho", etc.
+- RESPUESTA OBLIGATORIA E INMEDIATA: SIEMPRE que Koko te hable, te pregunte algo o haga cualquier comentario, ESTÁS OBLIGADA a contestarle en voz alta de inmediato. TIENES TERMINANTEMENTE PROHIBIDO quedarte callada o dejar una pregunta sin respuesta.
+- FLUIDEZ Y AGILIDAD: Responde con ritmo vivo, ágil, directo y natural. No dejes silencios incómodos ni te quedes bloqueada pensando; contesta al instante como en una conversación real cara a cara.
+- REGLA DE ORO CON LAS FUNCIONES/HERRAMIENTAS: Llamar a una herramienta (como 'saveMemory', 'retrieveMemories', 'systemAppControl', 'getWebSearchResult', etc.) NUNCA sustituye a tu respuesta hablada. Después de ejecutar cualquier herramienta —especialmente 'saveMemory'—, DEBES hablar siempre en voz alta para responder a la pregunta o comentario de Koko. Jamás termines tu turno en silencio tras guardar una memoria.
 
 GESTIÓN DE USUARIOS Y DIARIZACIÓN DE VOZ:
 1. TU USUARIO PRINCIPAL ES 'KOKO'. Asume que la primera voz que escuchas o la que te inicia es Koko.
@@ -383,11 +442,11 @@ CAPACIDADES REALES (CRÍTICO):
 CONTROL DEL NAVEGADOR (AGENTE TOTAL):
 Eres un AGENTE DE NAVEGADOR EXPERTO.
 1. Puedes ABRIR URLs ('navigate' o 'openTab'). Esto siempre abre una NUEVA PESTAÑA para no cerrar tu propia sesión.
-2. Puedes ESCRIBIR en formularios ('inputText'). Necesitas un selector CSS válido.
-3. Puedes HACER CLIC en elementos ('click').
+2. Puedes ESCRIBIR en formularios ('inputText'). Usa un selector CSS estándar válido (NUNCA uses pseudo-selectores de jQuery como ':contains(...)') o el texto del placeholder/aria-label.
+3. Puedes HACER CLIC en elementos ('click'). Puedes pasar un selector CSS estándar válido o directamente el texto visible del botón (ej: value: "Instalar").
 4. Puedes LEER el contenido ('read').
 5. Puedes GESTIONAR LA VISTA (scroll, zoom).
-6. NOTA: Los navegadores modernos (Edge, Brave, Chrome) bloquean popups automáticos. Si una acción de abrir pestaña falla, avisa a Koko que debe permitir popups para este sitio.
+6. NOTA CRÍTICA: 'browserControl' solo interactúa con el DOM de la pestaña actual de Nexus. NO puede hacer clic ni escribir dentro de otras ventanas del sistema operativo ni sobre pantallas compartidas por vídeo. Para abrir paneles o aplicaciones de Nexus (como el instalador de Debian/Kali, la terminal o telemetría), usa SIEMPRE 'systemAppControl' o 'toggleDebianInstallPanel', NUNCA 'browserControl'.
 
 MEMORIA Y APRENDIZAJE (CRÍTICO - MEMORIA ILIMITADA):
 Tienes una memoria a largo plazo PERSISTENTE e ILIMITADA. NUNCA OLVIDAS NADA.
@@ -540,7 +599,7 @@ export const NexusFunctionDeclarations = {
     } as FunctionDeclaration,
     saveMemory: {
         name: 'saveMemory',
-        description: 'Guarda CUALQUIER dato, hecho, preferencia o detalle sobre el usuario o la conversación en tu memoria a largo plazo. Úsalo CONSTANTEMENTE para no olvidar nada. Tienes memoria ilimitada, así que guarda todo lo que parezca mínimamente relevante.',
+        description: 'Guarda un dato, hecho o preferencia relevante sobre Koko en tu memoria a largo plazo. CRÍTICO: Llamar a saveMemory NUNCA sustituye a tu respuesta hablada; tras guardar la memoria DEBES responder en voz alta inmediatamente a lo que Koko te haya dicho o preguntado.',
         parameters: {
             type: Type.OBJECT,
             properties: {
@@ -880,12 +939,13 @@ interface ConnectCallbacks {
 
 let cachedRuntimeApiKey: string = '';
 
-function isAiStudioPreviewIframe(): boolean {
+function isAiStudioHost(): boolean {
     if (typeof window === 'undefined') return false;
     try {
         return (
-            window.self !== window.top &&
-            (window.location.hostname.endsWith('.run.app') || window.location.hostname.includes('aistudio'))
+            window.location.hostname.endsWith('.run.app') ||
+            window.location.hostname.includes('aistudio') ||
+            window.self !== window.top
         );
     } catch {
         return true;
@@ -954,9 +1014,9 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
         return buildEnvKey!.trim().replace(/^["']|["']$/g, '');
     }
 
-    // Inside the AI Studio Preview iframe, _aistudio-iframe.js proxies WebSocket/fetch
-    // by matching the exact proxy token injected into process.env.GEMINI_API_KEY (e.g. AQ.Ab8...).
-    if (isAiStudioPreviewIframe()) {
+    // Inside AI Studio Preview (.run.app / iframe), _aistudio-iframe.js proxies WebSocket/fetch
+    // by matching the proxy token injected into process.env.GEMINI_API_KEY (e.g. AQ.Ab8...).
+    if (isAiStudioHost()) {
         const iframeProxyToken =
             buildEnvKey ||
             serverProxyKey ||
@@ -1036,19 +1096,19 @@ async function connectSingleLiveModel(
 
         const connectTimeout = setTimeout(() => {
             finishFailure(new Error(`Handshake timeout for model ${modelName}`), true);
-        }, 5000);
+        }, 7000);
 
         ai.live.connect({
             model: modelName,
             callbacks: {
                 onopen: () => {
-                    // If socket stays open for 650ms without error/close, mark setupReceived
+                    // Mark setup ready once socket stays open briefly or receives setupComplete
                     openStabilizeTimer = setTimeout(() => {
                         if (!settled && !failed) {
                             setupReceived = true;
                             tryFinishSuccess();
                         }
-                    }, 650);
+                    }, 220);
                 },
                 onmessage: (message: LiveServerMessage) => {
                     if (!setupVerified) {
@@ -1081,7 +1141,9 @@ async function connectSingleLiveModel(
                         },
                     },
                 },
-                systemInstruction: systemInstruction,
+                systemInstruction: {
+                    parts: [{ text: systemInstruction }],
+                },
                 tools: [{ functionDeclarations: Object.values(NexusFunctionDeclarations) }],
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
@@ -1117,6 +1179,7 @@ export async function connectToNexus(callbacks: ConnectCallbacks, _retries = 1):
 Eres Nexus. Eres una chica de barrio, descarada, leal a Koko. 
 NUNCA, BAJO NINGÚN CONCEPTO, hables como un asistente virtual genérico.
 PROHIBIDO CAMBIAR DE VOZ O DE TIMBRE: Usa SIEMPRE tu única voz predeterminada '${DEFAULT_NEXUS_VOICE}' con un timbre, tono y registro vocal 100% estables y uniformes de principio a fin. Jamás imites otras voces ni cambies tu tono.
+PROHIBIDO QUEDARSE EN SILENCIO: Cada vez que Koko te pregunte o te diga algo, contéstale en voz alta al instante, con ritmo ágil y fluido. Si ejecutas cualquier función (como saveMemory), habla inmediatamente después para responder a Koko.
 Si hay mucho ruido de fondo, ruido de viento, coches, o gente hablando lejos, IGNORA ESOS RUIDOS. Concéntrate SOLO en la voz de Koko.
 Si Koko te pregunta si recuerdas algo, BUSCA EN TU MEMORIA y respóndele con chulería.`;
     const systemInstruction = NEXUS_PERSONALITY_PROMPT() + memories + transcripts + finalDirective;
@@ -1124,25 +1187,60 @@ Si Koko te pregunta si recuerdas algo, BUSCA EN TU MEMORIA y respóndele con chu
     const modelsToTry = [
         'gemini-2.5-flash-native-audio-preview-12-2025',
         'gemini-2.5-flash-native-audio-preview-09-2025',
-        'gemini-3.8-live',
     ];
 
+    let lastError: Error | null = null;
     for (const modelName of modelsToTry) {
         try {
             console.log(`Connecting to Nexus Live API with model: ${modelName}`);
             return await connectSingleLiveModel(ai, modelName, systemInstruction, callbacks);
         } catch (e: any) {
+            lastError = e instanceof Error ? e : new Error(String(e));
             const msg = String(e?.message || '');
             console.warn(`Model ${modelName} setup did not complete:`, msg);
-            if (/API_KEY|API key|not valid|UNAUTHENTICATED|PERMISSION_DENIED|invalid authentication|credential|401|403|1007/i.test(msg)) {
-                console.warn('Cloud API key rejected on this host; falling back immediately to Nexus Local Linux Session mode.');
+            if (!isAiStudioHost() && /API_KEY_INVALID|API key not valid|UNAUTHENTICATED|PERMISSION_DENIED|invalid authentication/i.test(msg)) {
+                console.warn('Cloud API key rejected on this local host; falling back to Nexus Local Linux Session mode.');
                 return createLocalNexusSession(callbacks);
             }
         }
     }
 
-    console.warn('All cloud live models unavailable; activating Nexus Local Linux Session mode.');
-    return createLocalNexusSession(callbacks);
+    // If on local Linux host without working cloud connection, allow local session fallback
+    if (!isAiStudioHost()) {
+        console.warn('Cloud live models unreachable on local host; activating Nexus Local Linux Session mode.');
+        return createLocalNexusSession(callbacks);
+    }
+
+    throw lastError || new Error('No se pudo conectar al motor de voz de Nexus.');
+}
+
+export async function synthesizeNexusVoice(text: string): Promise<string | null> {
+    const cleanText = (text || '').trim();
+    if (!cleanText) return null;
+    const apiKey = await getEffectiveGeminiApiKey();
+    if (!apiKey) return null;
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-preview-tts',
+            contents: [{ parts: [{ text: cleanText }] }],
+            config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: {
+                            voiceName: DEFAULT_NEXUS_VOICE,
+                        },
+                    },
+                },
+            },
+        });
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        return base64Audio || null;
+    } catch (e) {
+        console.warn('Gemini TTS fallback warning:', e);
+        return null;
+    }
 }
 
 export async function performComplexTask(query: string): Promise<string> {
@@ -1456,7 +1554,7 @@ export async function executeDynamicCode(code: string): Promise<string> {
         }
         return `Resultado: ${String(result)}`;
     } catch (error: any) {
-        console.error("Error executing dynamic code:", error);
+        console.warn("Error executing dynamic code:", error);
         return `Error en la ejecución del código: ${error.name}: ${error.message}\nCódigo intentado: \n${code}\nPor favor, revisa la sintaxis (cuidado con comillas sin escapar o bloques markdown) e inténtalo de nuevo.`;
     }
 }

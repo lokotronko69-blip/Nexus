@@ -43,6 +43,44 @@ function computeVaultChecksum(vault: Omit<NexusVaultData, 'checksumSha256'>): st
   return crypto.createHash('sha256').update(payload).digest('hex');
 }
 
+function compactServerTranscripts(
+  list: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }>
+): Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> {
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const merged: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> = [];
+  for (const item of list) {
+    if (!item || typeof item.text !== 'string') continue;
+    const raw = item.text;
+    if (!raw.trim()) continue;
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      prev.role === item.role &&
+      Math.abs((item.timestamp || 0) - (prev.timestamp || 0)) < 15000 &&
+      (raw.length < 32 || prev.text.length < 32 || !/[.!?¡¿]$/.test(prev.text.trim()))
+    ) {
+      const needsSpace =
+        prev.text.length > 0 &&
+        !/\s$/.test(prev.text) &&
+        !/^[\s.,!?;:)]/.test(raw) &&
+        raw.trim().length > 3;
+      prev.text = (prev.text + (needsSpace ? ' ' : '') + raw).replace(/\s+/g, ' ');
+      prev.timestamp = item.timestamp || prev.timestamp;
+    } else {
+      merged.push({
+        id: item.id,
+        text: raw.trim(),
+        role: item.role,
+        timestamp: item.timestamp || Date.now(),
+      });
+    }
+  }
+  return merged
+    .map((m, idx) => ({ ...m, id: m.id ?? idx + 1, text: m.text.trim() }))
+    .filter((m) => m.text.length > 0)
+    .slice(-60);
+}
+
 function readDataVault(): NexusVaultData {
   const vaultPath = getDataVaultPath();
   try {
@@ -52,7 +90,7 @@ function readDataVault(): NexusVaultData {
         version: raw.version || NEXUS_VERSION,
         updatedAt: raw.updatedAt || new Date().toISOString(),
         memories: Array.isArray(raw.memories) ? raw.memories : [],
-        transcripts: Array.isArray(raw.transcripts) ? raw.transcripts : [],
+        transcripts: compactServerTranscripts(Array.isArray(raw.transcripts) ? raw.transcripts : []),
         notes: typeof raw.notes === 'string' ? raw.notes : '',
       };
       return {
@@ -99,7 +137,7 @@ function writeDataVault(partial: Partial<NexusVaultData>): NexusVaultData {
   }
 
   const mergedTranscripts = Array.isArray(partial.transcripts) && partial.transcripts.length > 0
-    ? partial.transcripts.slice(-100)
+    ? compactServerTranscripts(partial.transcripts)
     : current.transcripts;
 
   const mergedNotes = typeof partial.notes === 'string' && partial.notes.trim().length > 0
@@ -732,10 +770,22 @@ async function startServer() {
     const memTotalGb = ((snap.memory?.totalSystemMB ?? 0) / 1024).toFixed(1);
     const host = os.hostname();
     const kernel = `${os.type()} ${os.release()} (${os.arch()})`;
+    const vault = readDataVault();
 
     let reply = '';
-    if (/(hola|buenas|qu[eé] pasa|me escuchas|est[aá]s ah[ií]|oye nexus)/i.test(lower)) {
-      reply = `¡Qué pasa, Koko! Te escucho alto y claro desde tu Linux (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dime qué necesitas o qué módulo quieres que abra.`;
+    if (/(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|oye nexus|ey nexus)/i.test(lower)) {
+      reply = `¡Qué pasa, Koko! Te escucho al pelo desde tu máquina (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dispara, ¿qué hacemos hoy?`;
+    } else if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate)/i.test(lower)) {
+      reply = `Soy Nexus, tu ingeniera sénior, experta en ciberseguridad y compañera fiel al cien por cien. Estoy corriendo directamente en tu sistema ${host}, lista para darle caña a lo que me pidas, Koko.`;
+    } else if (/(c[oó]mo est[aá]s|qu[eé] tal|todo bien)/i.test(lower)) {
+      reply = `¡A tope de energía, Koko! Con la CPU fresquita al ${cpuUsage}% y la memoria al ${memPct}%. ¿Tú qué tal vas, jefe?`;
+    } else if (/(recuerdas|acuerdas|memoria|qu[eé] sabes de m[ií])/i.test(lower)) {
+      if (vault.memories && vault.memories.length > 0) {
+        const recentFacts = vault.memories.slice(-4).map(m => m.fact).join('; ');
+        reply = `¡Pues claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos guardados en mi bóveda. Por ejemplo: ${recentFacts}.`;
+      } else {
+        reply = `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Pídeme que abra las memorias cuando quieras.`;
+      }
     } else if (/(cpu|procesador|memoria|ram|temperatura|consumo|rendimiento|estado|sistema|hardware)/i.test(lower)) {
       reply = `Aquí tienes el parte de tu máquina, Koko: en ${host} (${kernel}) la CPU va al ${cpuUsage}% (${cpuSpeed} MHz), y la memoria RAM está al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso). Todo fino.`;
     } else if (/(hora|fecha|d[ií]a es)/i.test(lower)) {
@@ -753,10 +803,12 @@ async function startServer() {
       reply = ips.length > 0
         ? `Tus interfaces de red activas son ${ips.join(', ')}, Koko.`
         : `Estoy corriendo en local sobre ${host} en el puerto ${PORT}, Koko.`;
+    } else if (/(gracias|perfecto|genial|vale|ok|de lujo|guay)/i.test(lower)) {
+      reply = `¡De nada, jefe! Para eso estamos. Si necesitas abrir algún módulo o darle caña a otra cosa, tú mandas.`;
     } else if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
       reply = `Ahora mismo estoy operando en modo local en tu Linux sin fallos, Koko. Si quieres enchufarme el motor Gemini Live de la nube, abre tu terminal y pon: nexus apikey seguido de tu clave AIza, o abre mi terminal interna y escribe apikey y tu clave.`;
     } else {
-      reply = `Te he escuchado, Koko: "${query}". Estoy activa en modo local sobre tu Linux (${host}, CPU al ${cpuUsage}%, RAM al ${memPct}%). Puedes pedirme abrir la terminal, la telemetría, las notas o los procesos, o activar Gemini Live con el comando nexus apikey.`;
+      reply = `¡Oído cocina, Koko! Te escucho perfectamente en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme abrir la terminal, la telemetría, el instalador de Debian y Kali, las notas o el gestor de procesos, o conecta Gemini Live con nexus apikey.`;
     }
 
     res.json({

@@ -20,20 +20,24 @@ export function decode(base64: string): Uint8Array {
     return bytes;
 }
 
-export async function decodeAudioData(
+export function decodeAudioData(
     data: Uint8Array,
     ctx: AudioContext,
     sampleRate: number,
     numChannels: number,
-): Promise<AudioBuffer> {
-    const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
-    const frameCount = dataInt16.length / numChannels;
-    const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+): AudioBuffer {
+    const sampleCount = Math.floor(data.byteLength / 2);
+    const alignedBuffer =
+        data.byteOffset % 2 === 0
+            ? new Int16Array(data.buffer, data.byteOffset, sampleCount)
+            : new Int16Array(data.slice(0, sampleCount * 2).buffer);
+    const frameCount = Math.floor(alignedBuffer.length / numChannels);
+    const buffer = ctx.createBuffer(numChannels, Math.max(1, frameCount), sampleRate);
 
     for (let channel = 0; channel < numChannels; channel++) {
         const channelData = buffer.getChannelData(channel);
         for (let i = 0; i < frameCount; i++) {
-            channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+            channelData[i] = alignedBuffer[i * numChannels + channel] / 32768.0;
         }
     }
     return buffer;
