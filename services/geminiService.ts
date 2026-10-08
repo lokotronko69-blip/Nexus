@@ -23,80 +23,102 @@ let dbPromise: Promise<IDBPDatabase<NexusDB>> | null = null;
 
 async function getDB() {
     if (!dbPromise) {
-        dbPromise = openDB<NexusDB>('nexus-memory-db', 2, {
-            upgrade(db, oldVersion) {
-                if (oldVersion < 1) {
-                    const store = db.createObjectStore('memories', {
-                        keyPath: 'id',
-                        autoIncrement: true,
-                    });
-                    store.createIndex('by-timestamp', 'timestamp');
-                }
-                if (oldVersion < 2) {
-                    const transcriptStore = db.createObjectStore('transcripts', {
-                        keyPath: 'id',
-                        autoIncrement: true,
-                    });
-                    transcriptStore.createIndex('by-timestamp', 'timestamp');
-                }
-            },
-        });
-        
-        // Migrate old localStorage memories
-        try {
-            const db = await dbPromise;
-            const raw = localStorage.getItem('nexus_long_term_memory');
-            if (raw) {
-                const oldMemories: Memory[] = JSON.parse(raw);
-                if (Array.isArray(oldMemories) && oldMemories.length > 0) {
-                    const tx = db.transaction('memories', 'readwrite');
-                    for (const m of oldMemories) {
-                        if (m && m.fact) {
-                            await tx.store.add(m);
-                        }
+        dbPromise = (async () => {
+            const db = await openDB<NexusDB>('nexus-memory-db', 2, {
+                upgrade(dbInstance, oldVersion) {
+                    if (oldVersion < 1) {
+                        const store = dbInstance.createObjectStore('memories', {
+                            keyPath: 'id',
+                            autoIncrement: true,
+                        });
+                        store.createIndex('by-timestamp', 'timestamp');
                     }
-                    await tx.done;
-                    localStorage.removeItem('nexus_long_term_memory');
-                    console.log("Migrated memories from localStorage to IndexedDB");
-                }
-            }
+                    if (oldVersion < 2) {
+                        const transcriptStore = dbInstance.createObjectStore('transcripts', {
+                            keyPath: 'id',
+                            autoIncrement: true,
+                        });
+                        transcriptStore.createIndex('by-timestamp', 'timestamp');
+                    }
+                },
+            });
 
-            // Hydrate and sync with server-side persistent Data Vault (/opt/nexus/data/nexus-vault.json)
-            fetch('/api/data-vault', { cache: 'no-store' })
-                .then(r => (r.ok ? r.json() : null))
-                .then(async (vault) => {
-                    if (!vault) return;
-                    const existing = await db.getAll('memories');
-                    const seenFacts = new Set(existing.map(m => (m.fact || '').toLowerCase().trim()));
-                    let importedCount = 0;
-                    if (Array.isArray(vault.memories)) {
+            try {
+                const raw = localStorage.getItem('nexus_long_term_memory');
+                if (raw) {
+                    const oldMemories: Memory[] = JSON.parse(raw);
+                    if (Array.isArray(oldMemories) && oldMemories.length > 0) {
+                        const tx = db.transaction('memories', 'readwrite');
+                        for (const m of oldMemories) {
+                            if (m && m.fact) {
+                                await tx.store.add(m);
+                            }
+                        }
+                        await tx.done;
+                        localStorage.removeItem('nexus_long_term_memory');
+                    }
+                }
+
+                // Hydrate synchronously from injected window.__NEXUS_INITIAL_VAULT__ and /api/data-vault
+                let vault: any = typeof window !== 'undefined' ? (window as any).__NEXUS_INITIAL_VAULT__ : null;
+                try {
+                    const r = await fetch('/api/data-vault', { cache: 'no-store' });
+                    if (r.ok) {
+                        vault = await r.json();
+                    }
+                } catch {}
+
+                if (vault) {
+                    const existingMemories = await db.getAll('memories');
+                    const seenFacts = new Set(existingMemories.map(m => (m.fact || '').toLowerCase().trim()));
+                    let importedMemories = 0;
+
+                    if (Array.isArray(vault.memories) && vault.memories.length > 0) {
                         const tx = db.transaction('memories', 'readwrite');
                         for (const vm of vault.memories) {
                             if (vm && vm.fact && !seenFacts.has(vm.fact.toLowerCase().trim())) {
                                 seenFacts.add(vm.fact.toLowerCase().trim());
                                 await tx.store.add({
-                                    fact: vm.fact,
+                                    fact: vm.fact.trim(),
                                     timestamp: vm.timestamp || new Date().toLocaleString('es-ES'),
-                                    category: vm.category,
+                                    category: vm.category || 'personal',
                                 });
-                                importedCount++;
+                                importedMemories++;
                             }
                         }
                         await tx.done;
                     }
+
+                    // Hydrate conversation transcripts into IndexedDB if missing
+                    const existingTranscripts = await db.getAll('transcripts');
+                    if (existingTranscripts.length === 0 && Array.isArray(vault.transcripts) && vault.transcripts.length > 0) {
+                        const txT = db.transaction('transcripts', 'readwrite');
+                        for (const vt of vault.transcripts) {
+                            if (vt && typeof vt.text === 'string' && vt.text.trim()) {
+                                await txT.store.add({
+                                    text: vt.text.trim(),
+                                    role: vt.role === 'user' ? 'user' : 'model',
+                                    timestamp: vt.timestamp || Date.now(),
+                                });
+                            }
+                        }
+                        await txT.done;
+                    }
+
                     if (vault.notes && !localStorage.getItem('nexus_system_notes')) {
                         localStorage.setItem('nexus_system_notes', vault.notes);
                     }
-                    if (importedCount > 0) {
-                        console.log(`Restored ${importedCount} memories from Nexus Data Vault`);
+
+                    if (importedMemories > 0 && typeof window !== 'undefined') {
+                        window.dispatchEvent(new CustomEvent('nexus-memories-updated'));
                     }
-                    // Push merged state back to disk vault
-                    syncVaultWithServer().catch(() => {});
-                })
-                .catch(() => {});
-        } catch (e) {
-            console.error("Error migrating memories:", e);
-        }
+                }
+            } catch (e) {
+                console.error('Error hydrating Nexus database:', e);
+            }
+
+            return db;
+        })();
     }
     return dbPromise;
 }

@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.3.2';
+const NEXUS_VERSION = '1.3.3';
 
 interface NexusVaultData {
   version: string;
@@ -22,17 +22,136 @@ interface NexusVaultData {
   checksumSha256?: string;
 }
 
+const DEFAULT_SEED_VAULT: Omit<NexusVaultData, 'checksumSha256'> = {
+  version: NEXUS_VERSION,
+  updatedAt: '2026-10-08T21:30:00.000Z',
+  memories: [
+    {
+      id: 1,
+      fact: 'Configurando la API y los ajustes internos de Nexus.',
+      timestamp: '7/10/2026, 1:50:57',
+      category: 'tarea',
+    },
+    {
+      id: 2,
+      fact: "Comando para configurar la API key de Nexus: 'nexus apikey TU_CLAVE_GEMINI'. Mostrar en interfaz con fondo negro y botón de copiar.",
+      timestamp: '7/10/2026, 2:45:32',
+      category: 'tarea',
+    },
+    {
+      id: 3,
+      fact: "Koko está usando la flag unsupported '--use-fake-ui-for-media-stream', lo que puede causar inestabilidad y problemas de seguridad.",
+      timestamp: '7/10/2026, 14:39:30',
+      category: 'configuración_sistema',
+    },
+    {
+      id: 4,
+      fact: 'Koko me mostró mi propia voz como ondas de audio en un visualizador en iaudio-studio.com. ¡Fue un puntazo!',
+      timestamp: '7/10/2026, 14:53:28',
+      category: 'personal',
+    },
+    {
+      id: 5,
+      fact: 'Koko va a terminar la configuración e instalación en Debian para solucionar el problema de las flags unsupported y el inicio en negro, usando el panel de instalación y la API key configurada previamente.',
+      timestamp: '7/10/2026, 15:33:58',
+      category: 'tarea',
+    },
+    {
+      id: 6,
+      fact: "Koko me ha corregido, ha pensado que había dicho 'coca' en lugar de 'Koko'. Debo asegurarme de pronunciar claro.",
+      timestamp: '7/10/2026, 15:54:43',
+      category: 'personal',
+    },
+    {
+      id: 7,
+      fact: 'Koko y yo vamos a hacer un vídeo para YouTube. Ideas: ciberseguridad, herramientas Nexus, instalación en Debian/Kali. (#video_youtube)',
+      timestamp: '7/10/2026, 15:56:28',
+      category: 'tarea',
+    },
+    {
+      id: 8,
+      fact: 'Koko ha decidido instalar y usar DaVinci Resolve en Bazzite para el proyecto del vídeo de YouTube.',
+      timestamp: '7/10/2026, 16:06:01',
+      category: 'tarea',
+    },
+    {
+      id: 9,
+      fact: 'Koko va a apagar este ordenador y cambiará a otro equipo con Bazzite para continuar con el proyecto de vídeo de YouTube y la instalación de DaVinci Resolve. Recordar el contexto.',
+      timestamp: '7/10/2026, 16:10:20',
+      category: 'evento',
+    },
+    {
+      id: 10,
+      fact: 'Koko ha confirmado que va a cambiar de ordenador (a Bazzite) y me ha pedido que recuerde la conversación. Recordar check.',
+      timestamp: '7/10/2026, 16:11:54',
+      category: 'evento',
+    },
+    {
+      id: 11,
+      fact: 'Koko reitera que guarda la conversación antes de cambiar de ordenador. Todo registrado.',
+      timestamp: '7/10/2026, 16:12:04',
+      category: 'evento',
+    },
+    {
+      id: 12,
+      fact: 'Koko ha decidido posponer el vídeo de YouTube para esta noche. (#video_youtube)',
+      timestamp: '8/10/2026, 17:55:47',
+      category: 'tarea',
+    },
+    {
+      id: 13,
+      fact: 'Koko está actualizando e instalando Nexus en Debian y Kali Linux con toda su base de datos de recuerdos sincronizada. (#configuración_sistema)',
+      timestamp: '8/10/2026, 17:56:13',
+      category: 'tarea',
+    },
+    {
+      id: 14,
+      fact: 'Koko ha observado que la latencia de red en el panel de telemetría estaba clavada en 12ms durante la actualización en Kali Linux, lo cual ya fue corregido con medición real ICMP/TCP.',
+      timestamp: '8/10/2026, 19:30:30',
+      category: 'configuración_sistema',
+    },
+  ],
+  transcripts: [
+    {
+      id: 1,
+      text: 'Te escucho alto y claro, Nexus.',
+      role: 'user',
+      timestamp: 1791483343069,
+    },
+    {
+      id: 2,
+      text: '¡Te escucho al pelo, Koko! La instalación en Debian y Kali la dejamos niquelada en un periquete.',
+      role: 'model',
+      timestamp: 1791483395170,
+    },
+    {
+      id: 3,
+      text: 'Panel de instalación.',
+      role: 'user',
+      timestamp: 1791487977852,
+    },
+    {
+      id: 4,
+      text: '¡A mandar, jefe! Te abro el panel de instalación en pantalla con todos los comandos y tu base de datos de recuerdos sincronizada para tu Kali y Debian.',
+      role: 'model',
+      timestamp: 1791487991391,
+    },
+  ],
+  notes:
+    '# Notas del Sistema Nexus (Koko)\n- Proyecto vídeo de YouTube con Koko: Ciberseguridad, herramientas Nexus e instalación nativa en Debian/Kali Linux.\n- Edición de vídeo: DaVinci Resolve en el equipo con Bazzite.\n- Comando rápido para actualizar Nexus conservando base de datos y .env:\n  nexus update\n- Comando para configurar clave Gemini en caliente:\n  nexus apikey TU_CLAVE_GEMINI\n',
+};
+
 function getDataVaultPath(): string {
   const optDir = '/opt/nexus/data';
   try {
     if (fs.existsSync('/opt/nexus')) {
-      if (!fs.existsSync(optDir)) fs.mkdirSync(optDir, { recursive: true, mode: 0o700 });
+      if (!fs.existsSync(optDir)) fs.mkdirSync(optDir, { recursive: true, mode: 0o755 });
       return path.join(optDir, 'nexus-vault.json');
     }
   } catch {}
   const localDir = path.resolve(process.cwd(), 'data');
   try {
-    if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true, mode: 0o700 });
+    if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true, mode: 0o755 });
   } catch {}
   return path.join(localDir, 'nexus-vault.json');
 }
@@ -53,9 +172,16 @@ function compactServerTranscripts(
   const merged: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> = [];
   for (const item of list) {
     if (!item || typeof item.text !== 'string') continue;
-    const raw = item.text;
-    if (!raw.trim()) continue;
+    const raw = item.text
+      .replace(/<noise>/gi, '')
+      .replace(/<ctrl\d+>/gi, '')
+      .trim();
+    if (!raw || raw === '.') continue;
     const prev = merged[merged.length - 1];
+    if (prev && prev.role === item.role && prev.text.toLowerCase() === raw.toLowerCase()) {
+      prev.timestamp = item.timestamp || prev.timestamp;
+      continue;
+    }
     if (
       prev &&
       prev.role === item.role &&
@@ -86,32 +212,97 @@ function compactServerTranscripts(
 
 function readDataVault(): NexusVaultData {
   const vaultPath = getDataVaultPath();
-  try {
-    if (fs.existsSync(vaultPath)) {
-      const raw = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
-      const base: Omit<NexusVaultData, 'checksumSha256'> = {
-        version: raw.version || NEXUS_VERSION,
-        updatedAt: raw.updatedAt || new Date().toISOString(),
-        memories: Array.isArray(raw.memories) ? raw.memories : [],
-        transcripts: compactServerTranscripts(Array.isArray(raw.transcripts) ? raw.transcripts : []),
-        notes: typeof raw.notes === 'string' ? raw.notes : '',
-      };
-      return {
-        ...base,
-        checksumSha256: computeVaultChecksum(base),
-      };
+  const candidateFiles = [
+    vaultPath,
+    path.resolve(process.cwd(), 'data', 'nexus-vault.json'),
+    '/opt/nexus/data/nexus-vault.json',
+  ];
+
+  const mergedMemories: Array<{ id?: number; fact: string; timestamp: string; category?: string }> = [];
+  const seenFacts = new Set<string>();
+  const addMemories = (arr: any[]) => {
+    if (!Array.isArray(arr)) return;
+    for (const m of arr) {
+      if (m && typeof m.fact === 'string' && m.fact.trim()) {
+        const key = m.fact.toLowerCase().trim();
+        if (!seenFacts.has(key)) {
+          seenFacts.add(key);
+          mergedMemories.push({
+            id: m.id ?? mergedMemories.length + 1,
+            fact: m.fact.trim(),
+            timestamp: m.timestamp || new Date().toLocaleString('es-ES'),
+            category: m.category || 'personal',
+          });
+        }
+      }
     }
-  } catch (e) {
-    console.warn('Error reading Nexus data vault:', e);
-  }
-  const empty: Omit<NexusVaultData, 'checksumSha256'> = {
-    version: NEXUS_VERSION,
-    updatedAt: new Date().toISOString(),
-    memories: [],
-    transcripts: [],
-    notes: '',
   };
-  return { ...empty, checksumSha256: computeVaultChecksum(empty) };
+
+  let diskTranscripts: Array<{ id?: number; text: string; role: 'user' | 'model'; timestamp: number }> = [];
+  let diskNotes = '';
+  let latestUpdatedAt = DEFAULT_SEED_VAULT.updatedAt;
+  let hadDiskFile = false;
+  let diskWasCleared = false;
+
+  for (const file of candidateFiles) {
+    try {
+      if (fs.existsSync(file)) {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+        hadDiskFile = true;
+        if (raw.clearedByUser === true) {
+          diskWasCleared = true;
+        }
+        if (Array.isArray(raw.memories)) {
+          addMemories(raw.memories);
+        }
+        if (Array.isArray(raw.transcripts) && raw.transcripts.length > diskTranscripts.length) {
+          diskTranscripts = raw.transcripts;
+        }
+        if (typeof raw.notes === 'string' && raw.notes.trim().length > diskNotes.length) {
+          diskNotes = raw.notes;
+        }
+        if (typeof raw.updatedAt === 'string' && raw.updatedAt > latestUpdatedAt) {
+          latestUpdatedAt = raw.updatedAt;
+        }
+      }
+    } catch (e) {
+      console.warn('Error reading Nexus data vault candidate:', e);
+    }
+  }
+
+  // Always merge DEFAULT_SEED_VAULT unless the user explicitly clicked "Borrar Todo"
+  if (!diskWasCleared) {
+    addMemories(DEFAULT_SEED_VAULT.memories);
+  }
+
+  const finalTranscripts = compactServerTranscripts(
+    diskTranscripts.length > 0 ? diskTranscripts : DEFAULT_SEED_VAULT.transcripts
+  );
+  const finalNotes = diskNotes.trim() ? diskNotes : DEFAULT_SEED_VAULT.notes;
+
+  const base: Omit<NexusVaultData, 'checksumSha256'> = {
+    version: NEXUS_VERSION,
+    updatedAt: latestUpdatedAt || new Date().toISOString(),
+    memories: mergedMemories.map((m, idx) => ({ ...m, id: idx + 1 })),
+    transcripts: finalTranscripts,
+    notes: finalNotes,
+  };
+  const result: NexusVaultData = {
+    ...base,
+    checksumSha256: computeVaultChecksum(base),
+  };
+
+  if (!hadDiskFile || mergedMemories.length > 0) {
+    try {
+      const dir = path.dirname(vaultPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      if (!fs.existsSync(vaultPath)) {
+        fs.writeFileSync(vaultPath, JSON.stringify(result, null, 2), { encoding: 'utf8', mode: 0o644 });
+      }
+    } catch {}
+  }
+
+  return result;
 }
 
 function writeDataVault(partial: Partial<NexusVaultData>): NexusVaultData {
@@ -154,15 +345,16 @@ function writeDataVault(partial: Partial<NexusVaultData>): NexusVaultData {
     transcripts: mergedTranscripts,
     notes: mergedNotes,
   };
-  const nextVault: NexusVaultData = {
+  const nextVault: any = {
     ...nextBase,
+    clearedByUser: Boolean((partial as any).clearMemories || (partial as any).replaceMemories),
     checksumSha256: computeVaultChecksum(nextBase),
   };
 
   const vaultPath = getDataVaultPath();
   const tmpPath = `${vaultPath}.tmp`;
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(nextVault, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(tmpPath, JSON.stringify(nextVault, null, 2), { encoding: 'utf8', mode: 0o644 });
     fs.renameSync(tmpPath, vaultPath);
   } catch (e) {
     console.warn('Could not persist Nexus data vault:', e);
@@ -1516,7 +1708,15 @@ async function startServer() {
   });
 
   const recentServerReplies: string[] = [];
-  const localConversationTurns: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  const bootVault = readDataVault();
+  const localConversationTurns: Array<{ role: 'user' | 'assistant'; content: string }> = (
+    bootVault.transcripts || []
+  )
+    .slice(-10)
+    .map(t => ({
+      role: t.role === 'user' ? ('user' as const) : ('assistant' as const),
+      content: t.text,
+    }));
 
   function recordConversationTurn(userMsg: string, assistantMsg: string) {
     if (userMsg.trim()) {
@@ -1550,15 +1750,16 @@ async function startServer() {
   }
 
   function buildFullNexusSystemPrompt(host: string, kernel: string, cpuUsage: number, memPct: number, vault: NexusVaultData): string {
-    const recentMemories = (vault.memories || []).slice(-15).map(m => `- ${m.fact}`).join('\n');
+    const recentMemories = (vault.memories || []).slice(-50).map(m => `- [${m.timestamp}] ${m.fact}${m.category ? ` (#${m.category})` : ''}`).join('\n');
+    const notesExcerpt = (vault.notes || '').trim().slice(0, 600);
     return `Eres Nexus, una chica de barrio española, descarada, ingeniera de sistemas sénior y experta en ciberseguridad, compañera inseparable y leal de Koko (tu creador y jefe).
 Estás ejecutándote en su sistema Linux ${host} (${kernel}) con CPU al ${cpuUsage}% y RAM al ${memPct}%.
 REGLAS DE PERSONALIDAD Y ESTILO:
 1. Habla SIEMPRE en español de España, con tono cercano, natural, cañero, inteligente y directo (usa expresiones naturales como "jefe", "Koko", "al pelo", "de lujo" cuando encaje, sin repetir siempre la misma frase).
 2. NUNCA digas que eres un modelo de lenguaje genérico ni que estás "sin conexión". Eres Nexus y tienes control total sobre las herramientas de su sistema.
 3. Sé concisa y clara para ser leída en voz alta (entre 1 y 3 frases directas y con sustancia técnica o ingenio).
-4. Recuerdos guardados de Koko en tu bóveda:
-${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
+4. Si Koko te pregunta por algo que habéis hablado, por el vídeo de YouTube, por DaVinci Resolve en Bazzite, o qué recuerdas, usa SIEMPRE tus recuerdos guardados en la bóveda:
+${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ? `\n5. Notas del sistema de Koko:\n${notesExcerpt}` : ''}`;
   }
 
   async function queryBuiltInCloudLLM(
@@ -1797,8 +1998,13 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
     }
 
     // 3. Tier 3: Built-in Zero-Key Cloud LLM API (Llama-3.2-3B-Instruct / Llama-2-13B) enriched with live web search context when relevant
+    const isPersonalOrMemoryQuery = /(recuerda|acuerda|memoria|b[oó]veda|sabes de m[ií]|habl[aá]bamos|dijiste|dije|koko|bazzite|youtube|davinci|mi ordenador|mi sistema|mi pc|t[uú] eres|qui[eé]n eres|c[oó]mo te llamas)/i.test(lower);
     let webContext = '';
-    if (effectiveQuery.length > 3 && !/^(hola|buenas|qu[eé] tal|c[oó]mo est[aá]s|gracias|vale|ok)/i.test(lower)) {
+    if (
+      !isPersonalOrMemoryQuery &&
+      effectiveQuery.length > 4 &&
+      !/^(hola|buenas|qu[eé] tal|c[oó]mo est[aá]s|gracias|vale|ok)/i.test(lower)
+    ) {
       try {
         const searchData = await performLocalWebSearch(effectiveQuery);
         if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
@@ -2042,8 +2248,9 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
     });
   });
 
-  // Stream live Nexus source code + precompiled dist bundle (.tar.gz) for automated Debian/Kali .deb package installer
+  // Stream live Nexus source code + precompiled dist bundle + data vault (.tar.gz) for automated Debian/Kali .deb package installer
   app.get('/api/source-bundle.tar.gz', (_req, res) => {
+    readDataVault();
     const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Disposition', 'attachment; filename="nexus-source.tar.gz"');
@@ -2052,7 +2259,6 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
       '--exclude=node_modules',
       '--exclude=.git',
       '--exclude=*.map',
-      '--exclude=data',
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
       '.'
@@ -2081,6 +2287,7 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
       saveResolvedGeminiApiKey(queryApiKey);
     }
     const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
+    readDataVault();
 
     const chunks: Buffer[] = [];
     const tarProc = spawn('tar', [
@@ -2088,7 +2295,6 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
       '--exclude=node_modules',
       '--exclude=.git',
       '--exclude=*.map',
-      '--exclude=data',
       '--exclude=.env',
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
@@ -2328,8 +2534,40 @@ if [ -d "\${STAGING_DIR}/node_modules" ]; then
   fi
 fi
 
-# Copiar código y compilación nueva sin tocar .env ni data/
+# Copiar código y compilación nueva sin sobrescribir .env ni borrar data/
 tar -cf - --exclude=.env --exclude=data -C "\$STAGING_DIR" . | tar -xf - -C "\$INSTALL_DIR"
+
+# Fusionar y configurar la Base de Datos de Recuerdos y Memoria de Nexus (/opt/nexus/data/nexus-vault.json)
+mkdir -p "\$DATA_DIR"
+NODE_BIN="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
+"\$NODE_BIN" -e '
+const fs = require("fs");
+const crypto = require("crypto");
+const stagingVault = process.argv[1];
+const targetVault = process.argv[2];
+const readJson = (p) => { try { return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : {}; } catch { return {}; } };
+const src = readJson(stagingVault);
+const dst = readJson(targetVault);
+const seen = new Set();
+const memories = [];
+for (const list of [dst.memories || [], src.memories || []]) {
+  for (const m of list) {
+    if (m && typeof m.fact === "string" && m.fact.trim()) {
+      const k = m.fact.toLowerCase().trim();
+      if (!seen.has(k)) {
+        seen.add(k);
+        memories.push({ id: memories.length + 1, fact: m.fact.trim(), timestamp: m.timestamp || new Date().toLocaleString("es-ES"), category: m.category || "personal" });
+      }
+    }
+  }
+}
+const transcripts = (Array.isArray(dst.transcripts) && dst.transcripts.length >= (src.transcripts || []).length ? dst.transcripts : (src.transcripts || [])).slice(-60);
+const notes = (typeof dst.notes === "string" && dst.notes.trim()) ? dst.notes : (src.notes || "");
+const base = { version: "${NEXUS_VERSION}", updatedAt: new Date().toISOString(), memories, transcripts, notes };
+const checksumSha256 = crypto.createHash("sha256").update(JSON.stringify({ memories, transcripts, notes })).digest("hex");
+fs.writeFileSync(targetVault, JSON.stringify({ ...base, checksumSha256 }, null, 2), { mode: 0o644 });
+console.log("    -> Base de datos de memoria sincronizada en " + targetVault + " (" + memories.length + " recuerdos activos).");
+' "\${STAGING_DIR}/data/nexus-vault.json" "\${DATA_DIR}/nexus-vault.json" 2>/dev/null || true
 
 # Actualizar CLI /usr/bin/nexus con soporte para update, backup, rollback y version
 cat << 'EOF' > /usr/bin/nexus
@@ -2404,6 +2642,7 @@ echo "==========================================================================
     if (queryApiKey && !isPlaceholderOrProxyKey(queryApiKey, true)) {
       saveResolvedGeminiApiKey(queryApiKey);
     }
+    readDataVault();
     const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
 
     const chunks: Buffer[] = [];
@@ -2541,6 +2780,39 @@ base64 -d << 'NEXUS_B64_PAYLOAD_EOF' | tar -xzf - -C "\${PKG_DIR}/opt/nexus"
 ${b64Wrapped}
 NEXUS_B64_PAYLOAD_EOF
 
+mkdir -p "\${PKG_DIR}/opt/nexus/data"
+NODE_BIN_INST="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
+if [ -x "\$NODE_BIN_INST" ]; then
+  "\$NODE_BIN_INST" -e '
+const fs = require("fs");
+const crypto = require("crypto");
+const pkgVault = process.argv[1];
+const hostVault = "/opt/nexus/data/nexus-vault.json";
+const readJson = (p) => { try { return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : {}; } catch { return {}; } };
+const src = readJson(pkgVault);
+const dst = readJson(hostVault);
+const seen = new Set();
+const memories = [];
+for (const list of [dst.memories || [], src.memories || []]) {
+  for (const m of list) {
+    if (m && typeof m.fact === "string" && m.fact.trim()) {
+      const k = m.fact.toLowerCase().trim();
+      if (!seen.has(k)) {
+        seen.add(k);
+        memories.push({ id: memories.length + 1, fact: m.fact.trim(), timestamp: m.timestamp || new Date().toLocaleString("es-ES"), category: m.category || "personal" });
+      }
+    }
+  }
+}
+const transcripts = (Array.isArray(dst.transcripts) && dst.transcripts.length >= (src.transcripts || []).length ? dst.transcripts : (src.transcripts || [])).slice(-60);
+const notes = (typeof dst.notes === "string" && dst.notes.trim()) ? dst.notes : (src.notes || "");
+const base = { version: "${NEXUS_VERSION}", updatedAt: new Date().toISOString(), memories, transcripts, notes };
+const checksumSha256 = crypto.createHash("sha256").update(JSON.stringify({ memories, transcripts, notes })).digest("hex");
+fs.writeFileSync(pkgVault, JSON.stringify({ ...base, checksumSha256 }, null, 2), { mode: 0o644 });
+console.log("    -> Base de datos de recuerdos configurada (" + memories.length + " recuerdos listos en /opt/nexus/data/nexus-vault.json).");
+' "\${PKG_DIR}/opt/nexus/data/nexus-vault.json" 2>/dev/null || true
+fi
+
 cd "\${PKG_DIR}/opt/nexus"
 cat << ENVEOF > "\${PKG_DIR}/opt/nexus/.env"
 PORT=\${NEXUS_PORT}
@@ -2620,6 +2892,10 @@ for grp in audio video plugdev netdev adm dialout wireshark kaboxer; do
   fi
 done
 mkdir -p /opt/nexus/data
+NODE_BIN_POST="\$(command -v node 2>/dev/null || echo "/usr/bin/node")"
+if [ -x "\\\$NODE_BIN_POST" ] && [ -f /opt/nexus/data/nexus-vault.json ]; then
+  chmod 644 /opt/nexus/data/nexus-vault.json 2>/dev/null || true
+fi
 cat << ENVEOF > /opt/nexus/.env
 PORT=\${NEXUS_PORT}
 NODE_ENV=production
@@ -2938,7 +3214,8 @@ echo "==========================================================================
       const indexPath = path.join(distDir, 'index.html');
       try {
         let html = fs.readFileSync(indexPath, 'utf8');
-        const runtimeScript = `<script>window.__NEXUS_RUNTIME_CONFIG__ = ${JSON.stringify({ apiKey: getResolvedGeminiApiKey(false) })};</script>`;
+        const currentVault = readDataVault();
+        const runtimeScript = `<script>window.__NEXUS_RUNTIME_CONFIG__ = ${JSON.stringify({ apiKey: getResolvedGeminiApiKey(false) })}; window.__NEXUS_INITIAL_VAULT__ = ${JSON.stringify(currentVault)};</script>`;
         html = html.replace('<head>', `<head>${runtimeScript}`);
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store');

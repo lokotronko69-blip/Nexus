@@ -3140,6 +3140,17 @@ export const App: React.FC = () => {
     }, [handleDisconnect]);
 
     useEffect(() => {
+        const refreshMemories = () => {
+            getMemoriesArray().then(setMemories).catch(() => {});
+        };
+        refreshMemories();
+        window.addEventListener('nexus-memories-updated', refreshMemories);
+        return () => {
+            window.removeEventListener('nexus-memories-updated', refreshMemories);
+        };
+    }, []);
+
+    useEffect(() => {
         if (showMemoriesModal) {
             getMemoriesArray().then(setMemories);
         }
