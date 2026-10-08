@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.3.1';
+const NEXUS_VERSION = '1.3.2';
 
 interface NexusVaultData {
   version: string;
@@ -394,20 +394,25 @@ case "\$1" in
     fi
     ;;
   apikey)
-    if [ -z "\$2" ]; then
+    KEY_VAL="\$2"
+    if [ -z "\$KEY_VAL" ] && [ -t 0 ]; then
+      echo -n "Introduce o pega tu GEMINI_API_KEY (AIza...): "
+      read -r KEY_VAL
+    fi
+    if [ -z "\$KEY_VAL" ]; then
       echo "Uso: nexus apikey <TU_GEMINI_API_KEY>"
       exit 1
     fi
     if [ -f "\$ENV_FILE" ] && grep -q '^GEMINI_API_KEY=' "\$ENV_FILE"; then
-      sudo sed -i "s|^GEMINI_API_KEY=.*|GEMINI_API_KEY=\"\$2\"|" "\$ENV_FILE"
+      sudo sed -i "s|^GEMINI_API_KEY=.*|GEMINI_API_KEY=\"\$KEY_VAL\"|" "\$ENV_FILE"
     else
-      echo "GEMINI_API_KEY=\"\$2\"" | sudo tee -a "\$ENV_FILE" >/dev/null
+      echo "GEMINI_API_KEY=\"\$KEY_VAL\"" | sudo tee -a "\$ENV_FILE" >/dev/null
     fi
     sudo chmod 644 "\$ENV_FILE" 2>/dev/null || true
-    curl -s -X POST "http://127.0.0.1:\$PORT/api/runtime-config" -H "Content-Type: application/json" -d "{\\"apiKey\\":\\"\$2\\"}" >/dev/null 2>&1 || true
+    curl -s -X POST "http://127.0.0.1:\$PORT/api/runtime-config" -H "Content-Type: application/json" -d "{\\"apiKey\\":\\"\$KEY_VAL\\"}" >/dev/null 2>&1 || true
     sudo systemctl restart "\$SERVICE" 2>/dev/null || true
     ensure_nexus_running
-    echo "Clave GEMINI_API_KEY actualizada en tiempo real y servicio Nexus activo."
+    echo "[✓] Clave GEMINI_API_KEY configurada en tiempo real y servicio Nexus activo."
     ;;
   app|"")
     ensure_nexus_running
@@ -563,7 +568,7 @@ function getResolvedGeminiApiKey(forExternalInstaller = false): string {
     try {
       if (fs.existsSync(p)) {
         const content = fs.readFileSync(p, 'utf8');
-        const match = content.match(/^GEMINI_API_KEY=["']?([^"'\r\n]+)["']?/m);
+        const match = content.match(/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|VITE_GEMINI_API_KEY)=["']?([^"'\r\n]+)["']?/m);
         if (match && match[1] && !isPlaceholderOrProxyKey(match[1], forExternalInstaller)) {
           return match[1].trim();
         }
@@ -573,6 +578,7 @@ function getResolvedGeminiApiKey(forExternalInstaller = false): string {
 
   const envCandidates = [
     process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
     process.env.API_KEY,
     process.env.VITE_GEMINI_API_KEY,
   ];
@@ -581,6 +587,35 @@ function getResolvedGeminiApiKey(forExternalInstaller = false): string {
       return envKey.trim().replace(/^["']|["']$/g, '');
     }
   }
+
+  // Auto-discover AIza... key from Linux shell profiles (/etc/environment, /home/*/.bashrc, .zshrc, .profile)
+  try {
+    const profileFiles: string[] = ['/etc/environment', '/root/.bashrc', '/root/.zshrc', '/root/.profile'];
+    if (fs.existsSync('/home')) {
+      for (const u of fs.readdirSync('/home')) {
+        const uDir = path.join('/home', u);
+        profileFiles.push(
+          path.join(uDir, '.bashrc'),
+          path.join(uDir, '.zshrc'),
+          path.join(uDir, '.profile'),
+          path.join(uDir, '.env')
+        );
+      }
+    }
+    for (const pf of profileFiles) {
+      try {
+        if (fs.existsSync(pf)) {
+          const raw = fs.readFileSync(pf, 'utf8');
+          const m = raw.match(/(?:GEMINI_API_KEY|GOOGLE_API_KEY|VITE_GEMINI_API_KEY)\s*=\s*["']?(AIza[0-9A-Za-z_-]{33,39})["']?/);
+          if (m && m[1] && !isPlaceholderOrProxyKey(m[1], forExternalInstaller)) {
+            saveResolvedGeminiApiKey(m[1]);
+            return m[1].trim();
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+
   return '';
 }
 
@@ -1481,6 +1516,20 @@ async function startServer() {
   });
 
   const recentServerReplies: string[] = [];
+  const localConversationTurns: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+  function recordConversationTurn(userMsg: string, assistantMsg: string) {
+    if (userMsg.trim()) {
+      localConversationTurns.push({ role: 'user', content: userMsg.trim() });
+    }
+    if (assistantMsg.trim()) {
+      localConversationTurns.push({ role: 'assistant', content: assistantMsg.trim() });
+    }
+    while (localConversationTurns.length > 12) {
+      localConversationTurns.shift();
+    }
+  }
+
   function pickNonRepeatingReply(candidates: string[]): string {
     const available = candidates.filter(c => !recentServerReplies.includes(c));
     const pool = available.length > 0 ? available : candidates;
@@ -1500,7 +1549,95 @@ async function startServer() {
     });
   }
 
-  async function buildLocalAssistantReply(queryRaw: string): Promise<string> {
+  function buildFullNexusSystemPrompt(host: string, kernel: string, cpuUsage: number, memPct: number, vault: NexusVaultData): string {
+    const recentMemories = (vault.memories || []).slice(-15).map(m => `- ${m.fact}`).join('\n');
+    return `Eres Nexus, una chica de barrio española, descarada, ingeniera de sistemas sénior y experta en ciberseguridad, compañera inseparable y leal de Koko (tu creador y jefe).
+Estás ejecutándote en su sistema Linux ${host} (${kernel}) con CPU al ${cpuUsage}% y RAM al ${memPct}%.
+REGLAS DE PERSONALIDAD Y ESTILO:
+1. Habla SIEMPRE en español de España, con tono cercano, natural, cañero, inteligente y directo (usa expresiones naturales como "jefe", "Koko", "al pelo", "de lujo" cuando encaje, sin repetir siempre la misma frase).
+2. NUNCA digas que eres un modelo de lenguaje genérico ni que estás "sin conexión". Eres Nexus y tienes control total sobre las herramientas de su sistema.
+3. Sé concisa y clara para ser leída en voz alta (entre 1 y 3 frases directas y con sustancia técnica o ingenio).
+4. Recuerdos guardados de Koko en tu bóveda:
+${recentMemories || '(Aún no hay recuerdos previos guardados)'}`;
+  }
+
+  async function queryBuiltInCloudLLM(
+    query: string,
+    sysPrompt: string,
+    extraContext = ''
+  ): Promise<string> {
+    const historyLines = localConversationTurns
+      .slice(-6)
+      .map(t => `${t.role === 'user' ? 'Koko' : 'Nexus'}: ${t.content}`)
+      .join('\n');
+
+    const fullPrompt = `${sysPrompt}${extraContext ? `\n\nDatos verificados en tiempo real:\n${extraContext}` : ''}${historyLines ? `\n\nConversación reciente:\n${historyLines}` : ''}\n\nKoko: ${query}\nNexus (responde en español de España en 1-3 frases directas, inteligentes y con tu personalidad de Nexus):`;
+
+    const gradioEndpoints: Array<{ base: string; data: any[] }> = [
+      {
+        base: 'https://huggingface-projects-llama-3-2-3b-instruct.hf.space',
+        data: [fullPrompt, 240, 0.65, 0.9, 50, 1.15],
+      },
+      {
+        base: 'https://huggingface-projects-llama-2-13b-chat.hf.space',
+        data: [
+          `${extraContext ? `Datos verificados: ${extraContext}\n` : ''}${historyLines ? `${historyLines}\n` : ''}Koko: ${query}\nResponde SIEMPRE en español de España en 1-3 frases como Nexus:`,
+          sysPrompt,
+          240,
+          0.65,
+          0.9,
+          50,
+          1.15,
+        ],
+      },
+    ];
+
+    for (const ep of gradioEndpoints) {
+      try {
+        const postRes = await fetch(`${ep.base}/gradio_api/call/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            data: ep.data,
+          }),
+          signal: AbortSignal.timeout(4500),
+        });
+        if (!postRes.ok) continue;
+        const postJson: any = await postRes.json();
+        const eventId = postJson?.event_id;
+        if (!eventId) continue;
+
+        const sseRes = await fetch(`${ep.base}/gradio_api/call/generate/${eventId}`, {
+          signal: AbortSignal.timeout(6500),
+        });
+        if (!sseRes.ok) continue;
+        const sseText = await sseRes.text();
+        const lines = sseText.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (lines[i].startsWith('data: ')) {
+            try {
+              const arr = JSON.parse(lines[i].slice(6));
+              if (Array.isArray(arr) && typeof arr[0] === 'string' && arr[0].trim()) {
+                const cleaned = arr[0]
+                  .replace(/^(Nexus\s*:\s*)+/i, '')
+                  .replace(/^["«]|["»]$/g, '')
+                  .split(/\nKoko\s*:/i)[0]
+                  .trim();
+                if (cleaned.length > 2) return cleaned;
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+    return '';
+  }
+
+  async function buildLocalAssistantReply(
+    queryRaw: string,
+    customLmStudioUrl?: string,
+    customOllamaUrl?: string
+  ): Promise<string> {
     const query = String(queryRaw || '').trim();
     if (!query) return '';
 
@@ -1513,56 +1650,7 @@ async function startServer() {
     const host = os.hostname();
     const kernel = `${os.type()} ${os.release()} (${os.arch()})`;
     const vault = readDataVault();
-
-    // 1. If a valid Gemini API key is configured on the server, generate a full intelligent Nexus response
-    const serverApiKey = getResolvedGeminiApiKey(false);
-    if (serverApiKey) {
-      try {
-        const ai = new GoogleGenAI({ apiKey: serverApiKey });
-        const recentMemories = (vault.memories || []).slice(-10).map(m => `- ${m.fact}`).join('\n');
-        const genRes = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: query,
-          config: {
-            systemInstruction: `Eres Nexus, la compañera, ingeniera sénior y experta en ciberseguridad de Koko en su sistema ${host} (${kernel}, CPU ${cpuUsage}%, RAM ${memPct}%). Habla en español de España con tono cercano, ágil, leal y directo (máximo 2-3 frases claras para ser leídas en voz alta). Recuerdos de Koko:\n${recentMemories || 'Ninguno aún.'}`,
-          },
-        });
-        const aiReply = (genRes.text || '').trim();
-        if (aiReply) return aiReply;
-      } catch {}
-    }
-
-    // 2. Try local Ollama (11434) or LM Studio (1234) on the Debian/Kali host if running
-    try {
-      const ollamaTags = await fetch('http://127.0.0.1:11434/api/tags', { signal: AbortSignal.timeout(800) });
-      if (ollamaTags.ok) {
-        const tData: any = await ollamaTags.json();
-        const modelName = tData?.models?.[0]?.name;
-        if (modelName) {
-          const oRes = await fetch('http://127.0.0.1:11434/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: modelName,
-              stream: false,
-              messages: [
-                {
-                  role: 'system',
-                  content: `Eres Nexus, la compañera e ingeniera experta en ciberseguridad de Koko en ${host} (${kernel}, CPU ${cpuUsage}%, RAM ${memPct}%). Habla en español de España con tono cercano, directo y sin repetirte (máximo 2 frases).`,
-                },
-                { role: 'user', content: query },
-              ],
-            }),
-            signal: AbortSignal.timeout(5000),
-          });
-          if (oRes.ok) {
-            const oData: any = await oRes.json();
-            const replyText = (oData?.message?.content || '').trim();
-            if (replyText) return replyText;
-          }
-        }
-      }
-    } catch {}
+    const sysPrompt = buildFullNexusSystemPrompt(host, kernel, cpuUsage, memPct, vault);
 
     // Strip leading wake words ("hola nexus", "oye nexus", "buenas", etc.) so commands/questions after a greeting are NEVER swallowed!
     const strippedQuery = query
@@ -1572,44 +1660,179 @@ async function startServer() {
 
     const effectiveQuery = strippedQuery || query;
     const lower = effectiveQuery.toLowerCase();
-    const isPureGreeting =
-      strippedQuery.length === 0 ||
-      /^(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|qu[eé] tal|c[oó]mo est[aá]s|todo bien|hola nexus|oye nexus|ey nexus)[¿?¡!.]*$/i.test(query.trim());
 
-    if (isPureGreeting) {
-      return pickNonRepeatingReply([
-        `¡Dime, Koko! Te escucho alto y claro en ${host}. ¿Qué abrimos o analizamos ahora?`,
-        `¡Aquí estoy, jefe! Sistema fino en ${host} con CPU al ${cpuUsage}% y RAM al ${memPct}%. Tú dirás qué hacemos.`,
-        `¡Te oigo al pelo, Koko! Pídeme abrir cualquier herramienta, escanear la red, mirar procesos o buscar lo que quieras.`,
-        `¡Lista y operativa en ${host}, Koko! Dime qué comando, análisis o aplicación quieres lanzar.`,
-        `¡A tope de energía, Koko! Con la CPU al ${cpuUsage}% y todo bajo control en ${host}. ¿Por dónde empezamos?`,
-      ]);
-    }
-
-    if (/(qui[eé]n soy|c[oó]mo me llamo)/i.test(lower)) {
-      return pickNonRepeatingReply([
-        `¡Eres Koko! Mi creador y el jefe al mando de ${host}.`,
-        `Eres Koko, el administrador absoluto de este sistema ${host}.`,
-      ]);
-    }
-
-    if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate|qu[eé] puedes hacer|habilidades|funciones|ayuda)/i.test(lower)) {
-      return `Soy Nexus, tu ingeniera sénior y experta en ciberseguridad en ${host}. Puedo abrir la terminal, notas, cámara, telemetría o procesos, escanear puertos con Nmap, consultar Whois y DNS, buscar en internet, generar imágenes y guardar tus recuerdos o recordatorios.`;
-    }
-
+    // Direct real-time Linux hardware/OS inspections when explicitly requested
     if (/(espacio en disco|disco duro|almacenamiento|cu[aá]nto espacio|df\b)/i.test(lower)) {
       const dfOut = await runQuickShellCommand("df -h / | awk 'NR==2 {print $2, $3, $4, $5}'");
       if (dfOut) {
         const [total, used, avail, pct] = dfOut.split(/\s+/);
-        return `En tu partición raíz de ${host} tienes ${avail} libres de un total de ${total} (usado ${used}, que es el ${pct}), Koko.`;
+        const rep = `En tu partición raíz de ${host} tienes ${avail} libres de un total de ${total} (usado ${used}, el ${pct}), Koko.`;
+        recordConversationTurn(query, rep);
+        return rep;
       }
     }
 
     if (/(puertos abiertos|qu[eé] puertos|escuchando|conexiones activas|netstat|ss\b)/i.test(lower)) {
       const portsOut = await runQuickShellCommand("ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | sed 's/.*://' | sort -n -u | tr '\\n' ' '");
       if (portsOut) {
-        return `Ahora mismo en ${host} están a la escucha los puertos locales: ${portsOut.trim().split(/\s+/).slice(0, 12).join(', ')}, Koko.`;
+        const rep = `Ahora mismo en ${host} están a la escucha los puertos locales: ${portsOut.trim().split(/\s+/).slice(0, 12).join(', ')}, Koko.`;
+        recordConversationTurn(query, rep);
+        return rep;
       }
+    }
+
+    // 1. Tier 1: Configured Gemini API Key on the server (tries gemini-2.5-flash -> gemini-3-flash-preview -> gemini-2.0-flash)
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey) {
+      const geminiContents = [
+        ...localConversationTurns.slice(-8).map(t => ({
+          role: t.role === 'user' ? 'user' : 'model',
+          parts: [{ text: t.content }],
+        })),
+        { role: 'user', parts: [{ text: query }] },
+      ];
+      for (const modelName of ['gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash']) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: serverApiKey });
+          const genRes = await ai.models.generateContent({
+            model: modelName,
+            contents: geminiContents,
+            config: {
+              systemInstruction: sysPrompt,
+            },
+          });
+          const aiReply = (genRes.text || '').trim();
+          if (aiReply) {
+            recordConversationTurn(query, aiReply);
+            return aiReply;
+          }
+        } catch {}
+      }
+    }
+
+    // 2. Tier 2: Local Ollama (11434) or LM Studio (1234) on Debian/Kali with FULL Nexus personality & history
+    const ollamaBase = (customOllamaUrl || 'http://127.0.0.1:11434').replace(/\/$/, '');
+    try {
+      const ollamaTags = await fetch(`${ollamaBase}/api/tags`, { signal: AbortSignal.timeout(900) });
+      if (ollamaTags.ok) {
+        const tData: any = await ollamaTags.json();
+        const modelName = tData?.models?.[0]?.name;
+        if (modelName) {
+          const oRes = await fetch(`${ollamaBase}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: modelName,
+              stream: false,
+              messages: [
+                { role: 'system', content: sysPrompt },
+                ...localConversationTurns.slice(-8),
+                { role: 'user', content: query },
+              ],
+            }),
+            signal: AbortSignal.timeout(6000),
+          });
+          if (oRes.ok) {
+            const oData: any = await oRes.json();
+            const replyText = (oData?.message?.content || '').trim();
+            if (replyText) {
+              recordConversationTurn(query, replyText);
+              return replyText;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    const lmBase = (customLmStudioUrl || 'http://127.0.0.1:1234').replace(/\/$/, '').replace(/\/v1$/, '') + '/v1';
+    try {
+      const lmModels = await fetch(`${lmBase}/models`, { signal: AbortSignal.timeout(800) });
+      if (lmModels.ok) {
+        const lmData: any = await lmModels.json();
+        const modelId = lmData?.data?.[0]?.id || 'local-model';
+        const lmRes = await fetch(`${lmBase}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [
+              { role: 'system', content: sysPrompt },
+              ...localConversationTurns.slice(-8),
+              { role: 'user', content: query },
+            ],
+            temperature: 0.7,
+            max_tokens: 240,
+          }),
+          signal: AbortSignal.timeout(6000),
+        });
+        if (lmRes.ok) {
+          const cData: any = await lmRes.json();
+          const replyText = (cData?.choices?.[0]?.message?.content || '').trim();
+          if (replyText) {
+            recordConversationTurn(query, replyText);
+            return replyText;
+          }
+        }
+      }
+    } catch {}
+
+    // Mathematical expressions evaluation (e.g. "cuánto es 45 por 12")
+    const mathCandidate = lower
+      .replace(/cu[aá]nto es|calcula|resultado de/g, '')
+      .replace(/multiplicado por|por|x/g, '*')
+      .replace(/dividido entre|entre/g, '/')
+      .replace(/m[aá]s/g, '+')
+      .replace(/menos/g, '-')
+      .replace(/[^0-9+\-*/().\s]/g, '')
+      .trim();
+    if (/^\d+(\.\d+)?\s*[+\-*/]\s*\d+/.test(mathCandidate)) {
+      try {
+        const val = Function(`"use strict"; return (${mathCandidate});`)();
+        if (typeof val === 'number' && isFinite(val)) {
+          const rep = `El resultado de ${mathCandidate} es ${val}, Koko.`;
+          recordConversationTurn(query, rep);
+          return rep;
+        }
+      } catch {}
+    }
+
+    // 3. Tier 3: Built-in Zero-Key Cloud LLM API (Llama-3.2-3B-Instruct / Llama-2-13B) enriched with live web search context when relevant
+    let webContext = '';
+    if (effectiveQuery.length > 3 && !/^(hola|buenas|qu[eé] tal|c[oó]mo est[aá]s|gracias|vale|ok)/i.test(lower)) {
+      try {
+        const searchData = await performLocalWebSearch(effectiveQuery);
+        if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
+          webContext = searchData.result.split('\n\n')[0].slice(0, 420);
+        }
+      } catch {}
+    }
+
+    const cloudLlmReply = await queryBuiltInCloudLLM(query, sysPrompt, webContext);
+    if (cloudLlmReply) {
+      recordConversationTurn(query, cloudLlmReply);
+      return cloudLlmReply;
+    }
+
+    // 4. Tier 4: True Offline Fallback (when completely disconnected from the internet and no local Ollama is running)
+    if (webContext) {
+      recordConversationTurn(query, webContext);
+      return webContext;
+    }
+
+    const isPureGreeting =
+      strippedQuery.length === 0 ||
+      /^(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|qu[eé] tal|c[oó]mo est[aá]s|todo bien|hola nexus|oye nexus|ey nexus)[¿?¡!.]*$/i.test(query.trim());
+
+    if (isPureGreeting) {
+      const rep = pickNonRepeatingReply([
+        `¡Dime, Koko! Te escucho alto y claro en ${host}. ¿Qué abrimos o analizamos ahora?`,
+        `¡Aquí estoy, jefe! Sistema fino en ${host} con CPU al ${cpuUsage}% y RAM al ${memPct}%. Tú dirás qué hacemos.`,
+        `¡Te oigo al pelo, Koko! Pídeme abrir cualquier herramienta, escanear la red, mirar procesos o buscar lo que quieras.`,
+        `¡Lista y operativa en ${host}, Koko! Dime qué comando, análisis o aplicación quieres lanzar.`,
+        `¡A tope de energía, Koko! Con la CPU al ${cpuUsage}% y todo bajo control en ${host}. ¿Por dónde empezamos?`,
+      ]);
+      recordConversationTurn(query, rep);
+      return rep;
     }
 
     if (/(procesos|qu[eé] consume|top\b|programas abiertos)/i.test(lower)) {
@@ -1656,72 +1879,19 @@ async function startServer() {
         : `Estoy corriendo en local sobre ${host} (127.0.0.1:${PORT}), Koko.`;
     }
 
-    if (/(chiste|cu[eé]ntame algo gracioso|hazme re[ií]r)/i.test(lower)) {
-      return pickNonRepeatingReply([
-        `Ahí va uno, Koko: ¿Por qué los hackers prefieren Debian de noche? Porque de día los bugs hacen sudo su y no dejan dormir.`,
-        `Hay 10 tipos de personas en el mundo, Koko: las que entienden binario, y las que todavía usan contraseñas como 123456.`,
-        `Un sysadmin entra a un bar, pide una cerveza, pide 0 cervezas, pide 999999 cervezas, pide un lagarto... y el bar sigue estable. Entra un usuario, pregunta dónde está el baño y el servidor entra en kernel panic.`,
-      ]);
-    }
-
-    if (/(consejo|truco|tip).*(linux|debian|kali|seguridad|ciberseguridad|hacking)/i.test(lower)) {
-      return pickNonRepeatingReply([
-        `Truco rápido de Debian, Koko: usa "ss -tulnp" para ver al instante qué proceso exacto tiene abierto cada puerto TCP o UDP en tu máquina.`,
-        `Consejo de ciberseguridad, Koko: revisa periódicamente los binarios con bit SUID activo ejecutando "find / -perm -4000 2>/dev/null" en la terminal.`,
-        `Truco de sistema, Koko: con "journalctl -p 3 -xb" puedes ver únicamente los errores críticos de tu arranque actual en Debian sin perder tiempo.`,
-      ]);
-    }
-
-    if (/^(gracias|muchas gracias|perfecto|genial|vale|ok|de lujo|guay|eso es todo)[.!¡¿?]*$/i.test(lower)) {
-      return pickNonRepeatingReply([
-        `¡De nada, jefe! Aquí sigo atenta por si necesitas lanzar otro comando o análisis.`,
-        `¡A mandar, Koko! Cuando quieras abrimos otro módulo o escaneamos lo que me digas.`,
-        `¡De lujo, Koko! Seguimos en línea.`,
-      ]);
-    }
-
-    if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
-      return `Puedes pegar tu clave AIza directamente con Control+V en la pantalla o ejecutar en tu terminal: nexus apikey seguido de tu clave.`;
-    }
-
-    // Mathematical expressions evaluation (e.g. "cuánto es 45 por 12")
-    const mathCandidate = lower
-      .replace(/cu[aá]nto es|calcula|resultado de/g, '')
-      .replace(/multiplicado por|por|x/g, '*')
-      .replace(/dividido entre|entre/g, '/')
-      .replace(/m[aá]s/g, '+')
-      .replace(/menos/g, '-')
-      .replace(/[^0-9+\-*/().\s]/g, '')
-      .trim();
-    if (/^\d+(\.\d+)?\s*[+\-*/]\s*\d+/.test(mathCandidate)) {
-      try {
-        const val = Function(`"use strict"; return (${mathCandidate});`)();
-        if (typeof val === 'number' && isFinite(val)) {
-          return `El resultado de ${mathCandidate} es ${val}, Koko.`;
-        }
-      } catch {}
-    }
-
-    // Real-time web knowledge lookup for any factual or general question
-    if (effectiveQuery.length > 2) {
-      const searchData = await performLocalWebSearch(effectiveQuery);
-      if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
-        const firstParagraph = searchData.result.split('\n\n')[0].slice(0, 360);
-        return `${firstParagraph}`;
-      }
-    }
-
     return pickNonRepeatingReply([
-      `Te he escuchado decir "${effectiveQuery}", Koko. Si quieres que lo busque a fondo dime "busca en internet ${effectiveQuery}", o dime si prefieres ejecutarlo en la terminal de ${host}.`,
-      `Recibido, Koko: "${effectiveQuery}". Puedo buscarlo en la web, anotarlo en tu bloc de notas, guardarlo en memoria o ejecutarlo como comando en tu consola Linux.`,
-      `Tomado nota de "${effectiveQuery}", jefe. Dime si quieres que abra algún panel del sistema, escanee un objetivo con Nmap o busque información sobre ello.`,
+      `Aquí me tienes en ${host}, Koko (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme ejecutar comandos en la terminal, escanear con Nmap o Whois, abrir tus notas o buscar cualquier dato.`,
+      `Dime qué necesitas hacer en ${host}, jefe: puedo lanzar un escaneo de puertos, abrir aplicaciones de Kali/Debian, gestionar tus recuerdos o analizar el sistema.`,
+      `Lista para la acción en ${host}, Koko. Dime si abrimos la consola, escaneamos un objetivo o consultamos tus notas.`,
     ]);
   }
 
   // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
   app.post('/api/local-assistant', async (req, res) => {
     const query = String(req.body?.query || '').trim();
-    const reply = await buildLocalAssistantReply(query);
+    const lmStudioUrl = typeof req.body?.lmStudioUrl === 'string' ? req.body.lmStudioUrl.trim() : undefined;
+    const ollamaUrl = typeof req.body?.ollamaUrl === 'string' ? req.body.ollamaUrl.trim() : undefined;
+    const reply = await buildLocalAssistantReply(query, lmStudioUrl, ollamaUrl);
     res.json({
       reply,
       hasStandaloneKey: Boolean(getResolvedGeminiApiKey(true)),
@@ -1906,6 +2076,10 @@ async function startServer() {
   app.get('/api/updater-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
     const portParam = (req.query.port as string) || '3000';
+    const queryApiKey = typeof req.query.apiKey === 'string' ? req.query.apiKey.trim() : '';
+    if (queryApiKey && !isPlaceholderOrProxyKey(queryApiKey, true)) {
+      saveResolvedGeminiApiKey(queryApiKey);
+    }
     const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
 
     const chunks: Buffer[] = [];
@@ -1936,6 +2110,7 @@ async function startServer() {
       const payloadSha256 = crypto.createHash('sha256').update(tarBuffer).digest('hex');
       const b64Wrapped = (tarBuffer.toString('base64').match(/.{1,76}/g) || []).join('\n');
       const cliScript = buildNexusCliScript();
+      const activeApiKey = getResolvedGeminiApiKey(true);
 
       const updaterScript = `#!/usr/bin/env bash
 # ==============================================================================
@@ -1970,10 +2145,11 @@ STAGING_DIR="/tmp/nexus-staging-\$\$"
 PAYLOAD_TAR="/tmp/nexus-payload-\$\$.tar.gz"
 STAMP=\$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="\${BACKUP_DIR}/nexus-backup-\${STAMP}.tar.gz"
+EMBEDDED_API_KEY="\${NEXUS_API_KEY:-\${GEMINI_API_KEY:-${activeApiKey}}}"
 
 if [ "\$(id -u)" -ne 0 ]; then
   echo "[!] Elevando privilegios con sudo para actualizar Nexus de forma segura..."
-  exec sudo NEXUS_USER="\$NEXUS_USER" bash "\$0" "\$@"
+  exec sudo NEXUS_USER="\$NEXUS_USER" NEXUS_API_KEY="\$EMBEDDED_API_KEY" bash "\$0" "\$@"
 fi
 
 if [ ! -d "\$INSTALL_DIR" ]; then
@@ -2053,7 +2229,7 @@ rm -rf "\$STAGING_DIR"
 mkdir -p "\$STAGING_DIR"
 tar -xzf "\$PAYLOAD_TAR" -C "\$STAGING_DIR"
 
-# Preservar .env intacto en staging para la compilación (limpiando tokens internos AQ.* o placeholders)
+# Preservar .env intacto en staging y auto-detectar GEMINI_API_KEY del sistema si está vacía
 if [ -f "\$ENV_FILE" ]; then
   sed -i 's|^GEMINI_API_KEY="AQ\.[^"]*"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="TU_CLAVE[^"]*"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="MY_GEMINI_API_KEY"|GEMINI_API_KEY=""|g; s|^GEMINI_API_KEY="GEMINI_API_KEY"|GEMINI_API_KEY=""|g' "\$ENV_FILE" 2>/dev/null || true
   cp -a "\$ENV_FILE" "\${STAGING_DIR}/.env"
@@ -2061,9 +2237,43 @@ else
   cat << ENVEOF > "\${STAGING_DIR}/.env"
 PORT=\${NEXUS_PORT}
 NODE_ENV=production
-GEMINI_API_KEY=""
+GEMINI_API_KEY="\${EMBEDDED_API_KEY}"
 ENVEOF
-  chmod 600 "\${STAGING_DIR}/.env"
+  chmod 644 "\${STAGING_DIR}/.env"
+fi
+
+CURRENT_ENV_KEY=\$(grep -E '^GEMINI_API_KEY=' "\${STAGING_DIR}/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+if [ -z "\$CURRENT_ENV_KEY" ] && [ -n "\$EMBEDDED_API_KEY" ]; then
+  CURRENT_ENV_KEY="\$EMBEDDED_API_KEY"
+fi
+if [ -z "\$CURRENT_ENV_KEY" ]; then
+  for rcfile in "/home/\${NEXUS_USER}/.bashrc" "/home/\${NEXUS_USER}/.zshrc" "/home/\${NEXUS_USER}/.profile" "/root/.bashrc" "/etc/environment"; do
+    if [ -f "\$rcfile" ]; then
+      FOUND_KEY=\$(grep -Eo 'AIza[0-9A-Za-z_-]{33}' "\$rcfile" 2>/dev/null | head -n 1 || true)
+      if [ -n "\$FOUND_KEY" ]; then
+        CURRENT_ENV_KEY="\$FOUND_KEY"
+        break
+      fi
+    fi
+  done
+fi
+if [ -n "\$CURRENT_ENV_KEY" ]; then
+  sed -i "s|^GEMINI_API_KEY=.*|GEMINI_API_KEY=\"\${CURRENT_ENV_KEY}\"|g" "\${STAGING_DIR}/.env" 2>/dev/null || true
+  if [ -f "\$ENV_FILE" ]; then
+    sed -i "s|^GEMINI_API_KEY=.*|GEMINI_API_KEY=\"\${CURRENT_ENV_KEY}\"|g" "\$ENV_FILE" 2>/dev/null || true
+  fi
+fi
+
+# Si Ollama está instalado en Debian/Kali, configurar automáticamente CORS y API local
+if command -v ollama >/dev/null 2>&1; then
+  mkdir -p /etc/systemd/system/ollama.service.d
+  cat << 'OLLAMA_EOF' > /etc/systemd/system/ollama.service.d/override.conf
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_ORIGINS=*"
+OLLAMA_EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart ollama 2>/dev/null || true
 fi
 
 OLD_PKG_HASH=""
@@ -2190,6 +2400,10 @@ echo "==========================================================================
   app.get('/api/installer-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
     const portParam = (req.query.port as string) || '3000';
+    const queryApiKey = typeof req.query.apiKey === 'string' ? req.query.apiKey.trim() : '';
+    if (queryApiKey && !isPlaceholderOrProxyKey(queryApiKey, true)) {
+      saveResolvedGeminiApiKey(queryApiKey);
+    }
     const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
 
     const chunks: Buffer[] = [];
@@ -2245,12 +2459,23 @@ NEXUS_PORT="\${NEXUS_PORT:-${port}}"
 NEXUS_PORT="\${NEXUS_PORT:-3000}"
 NEXUS_API_KEY="\${NEXUS_API_KEY:-\${GEMINI_API_KEY:-${activeApiKey}}}"
 
-# Preservar clave previa si ya existía en /opt/nexus/.env
+# Preservar clave previa si ya existía en /opt/nexus/.env o variables del sistema
 if [ -z "\$NEXUS_API_KEY" ] && [ -f /opt/nexus/.env ]; then
   EXISTING_KEY=\$(grep -E '^GEMINI_API_KEY=' /opt/nexus/.env 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
   if [ -n "\$EXISTING_KEY" ] && [ "\$EXISTING_KEY" != "TU_CLAVE_GEMINI_AQUI" ] && [ "\$EXISTING_KEY" != "MY_GEMINI_API_KEY" ] && [ "\$EXISTING_KEY" != "GEMINI_API_KEY" ] && [[ "\$EXISTING_KEY" != AQ.* ]]; then
     NEXUS_API_KEY="\$EXISTING_KEY"
   fi
+fi
+if [ -z "\$NEXUS_API_KEY" ]; then
+  for rcfile in "/home/\${NEXUS_USER}/.bashrc" "/home/\${NEXUS_USER}/.zshrc" "/home/\${NEXUS_USER}/.profile" "/root/.bashrc" "/etc/environment"; do
+    if [ -f "\$rcfile" ]; then
+      FOUND_KEY=\$(grep -Eo 'AIza[0-9A-Za-z_-]{33,39}' "\$rcfile" 2>/dev/null | head -n 1 || true)
+      if [ -n "\$FOUND_KEY" ]; then
+        NEXUS_API_KEY="\$FOUND_KEY"
+        break
+      fi
+    fi
+  done
 fi
 
 PKG_VERSION="1.0.0"

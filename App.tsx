@@ -2461,105 +2461,31 @@ export const App: React.FC = () => {
             return;
         }
 
-        const isLocalHttpOrigin =
-            typeof window !== 'undefined' &&
-            window.location.protocol === 'http:' &&
-            (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
-
-        // Intentar contactar con LLM local (LM Studio / Ollama) cuando se ejecuta en entorno local HTTP
+        // Delegate to Nexus Hybrid Intelligence Engine (/api/local-assistant):
+        // Automatically routes through:
+        //   Tier 1: Configured Gemini API (gemini-2.5-flash / gemini-3-flash-preview) with full Nexus personality, memories & history
+        //   Tier 2: Local Ollama (11434) or LM Studio (1234) on Debian/Kali with full Nexus personality & memory vault
+        //   Tier 3: Built-in Zero-Key Cloud LLM API enriched with live Wikipedia/DuckDuckGo context & conversation history
+        //   Tier 4: Real-time Debian/Kali Linux system diagnostics
         try {
-            if (!isLocalHttpOrigin) {
-                throw new Error('Use server-side local-assistant on HTTPS host');
-            }
-            const localBaseUrl = lmStudioUrl || 'http://localhost:1234';
-            const cleanUrl = localBaseUrl.replace(/\/$/, '').replace(/\/v1$/, '') + '/v1';
-
-            let lmModel = 'local-model';
-            try {
-                const mRes = await fetch(`${cleanUrl}/models`, { signal: AbortSignal.timeout(1200) });
-                if (mRes.ok) {
-                    const mData = await mRes.json();
-                    if (mData.data && mData.data.length > 0) {
-                        lmModel = mData.data[0].id;
-                    }
-                }
-            } catch (e) {}
-
-            const res = await fetch(`${cleanUrl}/chat/completions`, {
+            const localRes = await fetch('/api/local-assistant', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    model: lmModel,
-                    messages: [
-                        { role: 'system', content: 'Eres Nexus, una chica de barrio descarada, directa y sin filtros. Ahora estás funcionando en modo LOCAL SIN INTERNET. Responde de forma muy breve y directa.' },
-                        { role: 'user', content: transcript }
-                    ],
-                    temperature: 0.7,
-                    max_tokens: 150
-                })
+                    query: transcript,
+                    lmStudioUrl,
+                    ollamaUrl,
+                }),
             });
-
-            if (res.ok) {
-                const data = await res.json();
-                const reply = data.choices?.[0]?.message?.content || "No sé qué decirte.";
-                saveTranscript(reply, 'model');
-                if ((window as any).nexus?.speak) {
-                    (window as any).nexus.speak(reply);
-                }
-            } else {
-                const cleanOllamaUrl = (ollamaUrl || 'http://localhost:11434').replace(/\/$/, '');
-                let ollamaModel = 'llama3';
-                try {
-                    const tRes = await fetch(`${cleanOllamaUrl}/api/tags`, { signal: AbortSignal.timeout(1200) });
-                    if (tRes.ok) {
-                        const tData = await tRes.json();
-                        if (tData.models && tData.models.length > 0) {
-                            ollamaModel = tData.models[0].name;
-                        }
-                    }
-                } catch (e) {}
-
-                const ollamaRes = await fetch(`${cleanOllamaUrl}/api/generate`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: ollamaModel,
-                        prompt: `Eres Nexus, una chica de barrio descarada. Estás SIN CONEXIÓN. Mensaje: ${transcript}`,
-                        stream: false
-                    })
-                });
-                if (ollamaRes.ok) {
-                    const ollamaData = await ollamaRes.json();
-                    const reply = ollamaData.response || "No me sale nada.";
-                    saveTranscript(reply, 'model');
-                    if ((window as any).nexus?.speak) {
-                        (window as any).nexus.speak(reply);
-                    }
-                } else {
-                    throw new Error('Ni LM Studio ni Ollama respondieron correctamente');
-                }
+            if (localRes.ok) {
+                const localData = await localRes.json();
+                const reply = localData.reply || `Te escucho alto y claro, Koko: ${transcript}`;
+                speakAndSaveReply(reply);
+                return;
             }
-        } catch (e) {
-            try {
-                const localRes = await fetch('/api/local-assistant', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: transcript })
-                });
-                if (localRes.ok) {
-                    const localData = await localRes.json();
-                    const reply = localData.reply || `Te escucho Koko: ${transcript}`;
-                    saveTranscript(reply, 'model');
-                    if ((window as any).nexus?.speak) {
-                        (window as any).nexus.speak(reply);
-                    }
-                    return;
-                }
-            } catch {}
-            if ((window as any).nexus?.speak) {
-                (window as any).nexus.speak("Te he escuchado alto y claro, Koko: " + transcript + ". Pídeme abrir la terminal, la telemetría, las notas o el gestor de procesos.");
-            }
-        }
+        } catch {}
+
+        speakAndSaveReply(`Te he escuchado alto y claro, Koko: ${transcript}. Dime qué herramienta o análisis quieres lanzar.`);
     }, [lmStudioUrl, ollamaUrl]);
 
     const startOfflineRecognition = useCallback(() => {

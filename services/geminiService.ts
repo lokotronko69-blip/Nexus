@@ -985,6 +985,11 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
             const data = await res.json();
             if (isStandaloneGeminiApiKey(data?.apiKey)) {
                 cachedRuntimeApiKey = data.apiKey.trim().replace(/^["']|["']$/g, '');
+                try {
+                    if (typeof window !== 'undefined') {
+                        localStorage.setItem('nexus_gemini_api_key', cachedRuntimeApiKey);
+                    }
+                } catch {}
                 return cachedRuntimeApiKey;
             }
             if (typeof data?.proxyKey === 'string' && data.proxyKey.trim()) {
@@ -1003,6 +1008,12 @@ export async function getEffectiveGeminiApiKey(forceRefresh = false): Promise<st
         const localSavedKey = typeof window !== 'undefined' ? localStorage.getItem('nexus_gemini_api_key') : '';
         if (isStandaloneGeminiApiKey(localSavedKey)) {
             cachedRuntimeApiKey = localSavedKey!.trim().replace(/^["']|["']$/g, '');
+            // Automatically push browser key to server .env so Debian/Kali backend & installers stay synced
+            fetch('/api/runtime-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ apiKey: cachedRuntimeApiKey }),
+            }).catch(() => {});
             return cachedRuntimeApiKey;
         }
     } catch {}
