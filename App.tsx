@@ -2062,8 +2062,43 @@ export const App: React.FC = () => {
             }
         };
 
-        const lower = transcript.toLowerCase().trim();
+        // Strip conversational wake words ("Hola Nexus, ...", "Oye Nexus por favor...") so commands are ALWAYS obeyed
+        const cleanTranscript = transcript
+            .replace(/^(?:(?:hola|buenas|buenos d[ií]as|buenas tardes|buenas noches|oye|ey|hey|disculpa|perdona)\s*,?\s*)*(?:nexus\s*[,:.\s]\s*)?(?:por favor\s*[,:.\s]\s*)?(?:me puedes\s+|puedes\s+|podr[ií]as\s+|quiero que\s+|necesito que\s+)?/i, '')
+            .trim() || transcript;
+
+        const lower = cleanTranscript.toLowerCase().trim();
         const isCloseCmd = /(cierra|cerrar|quita|quitar|oculta|ocultar|esconde|desactiva|apaga|det[eé]n|para)/i.test(lower);
+
+        // 0. Immediate silence / stop speaking or close all panels
+        if (/^(c[aá]llate|silencio|para de hablar|deja de hablar|basta|shh)[.!¡¿?]*$/i.test(lower)) {
+            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+            sourcesRef.current.forEach(s => { try { s.stop(); } catch {} });
+            sourcesRef.current.clear();
+            nexusSpeakingUntilRef.current = 0;
+            setNexusStatus('LISTENING');
+            return;
+        }
+
+        if (/^(cierra todo|cerrar todo|limpia la pantalla|limpiar pantalla|oculta todo|cierra todas las ventanas)[.!¡¿?]*$/i.test(lower)) {
+            setShowTerminal(false);
+            setShowNotes(false);
+            setShowTelemetryPanel(false);
+            setShowProcessManager(false);
+            setShowDebianPanel(false);
+            setShowMemories(false);
+            setShowAppsMenu(false);
+            setCanvasVisible(false);
+            speakAndSaveReply("Pantalla despejada, Koko. He cerrado todos los paneles.");
+            return;
+        }
+
+        // Check UI panel open/close commands early if the user directly asked to open/close an integrated module
+        const earlyPanelFeedback = matchAndApplyPanelCommand(cleanTranscript) || matchAndApplyPanelCommand(transcript);
+        if (earlyPanelFeedback) {
+            speakAndSaveReply(earlyPanelFeedback);
+            return;
+        }
 
         // 1. Camera, Optical Zoom, Video Recording & Screen Share controls
         if (/(grabar v[ií]deo|empieza a grabar|inicia la grabaci[oó]n|graba esto|haz un v[ií]deo|para de grabar|det[eé]n la grabaci[oó]n|termina la grabaci[oó]n)/i.test(lower)) {
@@ -2150,24 +2185,24 @@ export const App: React.FC = () => {
         }
 
         // 3. Long-Term Memory saving & retrieval ("recuerda que...", "guarda en tu memoria...", "¿qué recuerdas?")
-        const memorySaveMatch = transcript.match(/^(?:nexus[, ]+)?(?:recuerda que|guarda en tu memoria que|guarda en la memoria que|memoriza que|no olvides que|apunta en tu memoria que|recuerda esto:?)\s+(.+)$/i);
+        const memorySaveMatch = cleanTranscript.match(/^(?:nexus[, ]+)?(?:recuerda que|guarda en tu memoria que|guarda en la memoria que|memoriza que|no olvides que|apunta en tu memoria que|recuerda esto:?)\s+(.+)$/i);
         if (memorySaveMatch && memorySaveMatch[1]) {
             const fact = memorySaveMatch[1].trim();
             await saveMemoryToStorage(fact, 'personal');
-            setMemories(getMemoriesArray());
+            setMemories(await getMemoriesArray());
             speakAndSaveReply(`¡Guardado a fuego en mi bóveda de memorias, Koko! Recordaré que: ${fact}.`);
             return;
         }
 
         if (/^(?:nexus[, ]+)?(?:qu[eé] recuerdas|qu[eé] sabes de m[ií]|dime mis recuerdos|dime mis memorias|lee mis memorias|busca en tu memoria)\b/i.test(lower)) {
-            const searchQ = transcript.replace(/^(?:nexus[, ]+)?(?:qu[eé] recuerdas sobre|qu[eé] recuerdas de|busca en tu memoria|qu[eé] recuerdas|qu[eé] sabes de m[ií]|dime mis recuerdos|dime mis memorias|lee mis memorias)\s*/i, '').trim();
+            const searchQ = cleanTranscript.replace(/^(?:nexus[, ]+)?(?:qu[eé] recuerdas sobre|qu[eé] recuerdas de|busca en tu memoria|qu[eé] recuerdas|qu[eé] sabes de m[ií]|dime mis recuerdos|dime mis memorias|lee mis memorias)\s*/i, '').trim();
             const memText = await getAllMemoriesFromStorage(searchQ || undefined);
             speakAndSaveReply(memText);
             return;
         }
 
         // 4. System Notes read & write ("escribe en las notas...", "apunta en el bloc de notas...", "lee mis notas")
-        const noteWriteMatch = transcript.match(/^(?:nexus[, ]+)?(?:escribe en las notas|apunta en las notas|apunta en el bloc de notas|añade a las notas|toma nota:?|anota:?)\s+(.+)$/i);
+        const noteWriteMatch = cleanTranscript.match(/^(?:nexus[, ]+)?(?:escribe en las notas|apunta en las notas|apunta en el bloc de notas|añade a las notas|escribe una nota|crea una nota|toma nota:?|anota:?)\s+(.+)$/i);
         if (noteWriteMatch && noteWriteMatch[1]) {
             const newNote = noteWriteMatch[1].trim();
             const existingNotes = localStorage.getItem('nexus_system_notes') || '# Notas del Sistema Nexus';
@@ -2196,7 +2231,7 @@ export const App: React.FC = () => {
         }
 
         // 5. Reminders & Alarms ("recuérdame en X minutos...", "pon una alarma en X minutos...")
-        const reminderMatch = transcript.match(/(?:recu[eé]rdame|av[ií]same|pon un recordatorio|pon una alarma)\s+(?:en|dentro de)\s+(\d+)\s*(minutos?|min|segundos?|seg|horas?)\s*(?:que|para|:)?\s*(.*)$/i);
+        const reminderMatch = cleanTranscript.match(/(?:recu[eé]rdame|av[ií]same|pon un recordatorio|pon una alarma)\s+(?:en|dentro de)\s+(\d+)\s*(minutos?|min|segundos?|seg|horas?)\s*(?:que|para|:)?\s*(.*)$/i);
         if (reminderMatch) {
             const amount = Math.max(1, parseInt(reminderMatch[1], 10) || 1);
             const unit = reminderMatch[2].toLowerCase();
@@ -2228,7 +2263,7 @@ export const App: React.FC = () => {
         // 6. Calendar / Agenda management ("añade al calendario...", "qué tengo en el calendario / agenda")
         if (/(calendario|agenda|eventos)/i.test(lower)) {
             const cal = JSON.parse(localStorage.getItem('nexus_calendar') || '[]');
-            const addCalMatch = transcript.match(/(?:a[ñn]ade|agrega|agenda|apunta|crea)\s+(?:al calendario|en la agenda|evento)\s+(.+)$/i);
+            const addCalMatch = cleanTranscript.match(/(?:a[ñn]ade|agrega|agenda|apunta|crea)\s+(?:al calendario|en la agenda|evento)\s+(.+)$/i);
             if (addCalMatch && addCalMatch[1]) {
                 const title = addCalMatch[1].trim();
                 const dateStr = new Date().toLocaleString('es-ES');
@@ -2254,7 +2289,7 @@ export const App: React.FC = () => {
         }
 
         // 7. Image Generation ("genera una imagen de...", "dibuja...", "crea una imagen de...")
-        const imgMatch = transcript.match(/^(?:nexus[, ]+)?(?:genera una imagen de|genera una imagen|crea una imagen de|crea una foto de|dibuja un|dibuja una|dibuja|haz un dibujo de|pinta un|pinta una)\s+(.+)$/i);
+        const imgMatch = cleanTranscript.match(/^(?:nexus[, ]+)?(?:genera una imagen de|genera una imagen|crea una imagen de|crea una foto de|dibuja un|dibuja una|dibuja|haz un dibujo de|pinta un|pinta una)\s+(.+)$/i);
         if (imgMatch && imgMatch[1] && !/^(la pizarra|el lienzo|el canvas)$/i.test(imgMatch[1].trim())) {
             const imgPrompt = imgMatch[1].trim();
             speakAndSaveReply(`¡Marchando, Koko! Estoy generando la imagen de "${imgPrompt}" ahora mismo...`);
@@ -2271,9 +2306,9 @@ export const App: React.FC = () => {
         }
 
         // 8. Cybersecurity & Pentesting Tools (Nmap, Portscan, Whois, DNS/Dig, IPInfo, SearchSploit, Headers, Hash, Base64)
-        const cyberMatch = transcript.match(/(?:escanea con nmap|haz un nmap a|nmap a|nmap|escanea los puertos de|escanea puertos de|portscan a|portscan|haz un whois a|whois a|whois|consulta el dns de|resuelve el dns de|haz un dig a|dig a|ipinfo de|geolocaliza la ip|searchsploit|busca exploits para|metasploit|audita las cabeceras de|nikto a)\s+([^\s,]+.*)$/i);
+        const cyberMatch = cleanTranscript.match(/(?:escanea con nmap|haz un escaneo nmap|haz un nmap a|haz un nmap|nmap a|nmap|escanea los puertos de|escanea puertos de|escanea los puertos|escanea mi red|portscan a|portscan|haz un whois a|whois a|whois|consulta el dns de|resuelve el dns de|haz un dig a|dig a|ipinfo de|geolocaliza la ip|searchsploit|busca exploits para|metasploit|audita las cabeceras de|nikto a)(?:\s+([^\s,]+.*))?$/i);
         if (cyberMatch) {
-            const rawTarget = cyberMatch[1].trim().split(/\s+/)[0];
+            const rawTarget = (cyberMatch[1] || '').trim().split(/\s+/)[0] || '127.0.0.1';
             let tool = 'nmap';
             let action = 'scan';
             if (/whois/i.test(lower)) { tool = 'whois'; action = 'lookup'; }
@@ -2297,7 +2332,7 @@ export const App: React.FC = () => {
             return;
         }
 
-        const hashMatch = transcript.match(/(?:calcula el hash|hash|calcula el)\s+(md5|sha256|sha-256|sha1|sha-1|sha512|base64)\s+(?:de\s+)?(.+)$/i);
+        const hashMatch = cleanTranscript.match(/(?:calcula el hash|hash|calcula el)\s+(md5|sha256|sha-256|sha1|sha-1|sha512|base64)\s+(?:de\s+)?(.+)$/i);
         if (hashMatch) {
             const kind = hashMatch[1].toLowerCase().replace('-', '');
             const textTarget = hashMatch[2].trim();
@@ -2401,7 +2436,7 @@ export const App: React.FC = () => {
         }
 
         // 11. Execute command in SystemTerminal ("ejecuta en la terminal ls -la", "corre el comando df -h")
-        const termCmdMatch = transcript.match(/^(?:nexus[, ]+)?(?:ejecuta en la terminal|ejecuta el comando|corre el comando|lanza en consola)\s+(.+)$/i);
+        const termCmdMatch = cleanTranscript.match(/^(?:nexus[, ]+)?(?:ejecuta en la terminal|ejecuta el comando|corre el comando|lanza en consola|ejecuta en consola)\s+(.+)$/i);
         if (termCmdMatch && termCmdMatch[1]) {
             const cmdToRun = termCmdMatch[1].trim();
             setTerminalInitialCmd(cmdToRun);
@@ -2411,7 +2446,7 @@ export const App: React.FC = () => {
         }
 
         // 12. Direct Web Search ("busca en internet...", "investiga sobre...")
-        const searchMatch = transcript.match(/^(?:nexus[, ]+)?(?:busca en internet|busca en la web|busca informaci[oó]n sobre|investiga sobre|busca en google)\s+(.+)$/i);
+        const searchMatch = cleanTranscript.match(/^(?:nexus[, ]+)?(?:busca en internet|busca en la web|busca informaci[oó]n sobre|investiga sobre|busca en google|b[uú]scame)\s+(.+)$/i);
         if (searchMatch && searchMatch[1]) {
             const q = searchMatch[1].trim();
             const searchRes = await getWebSearchResult(q);
@@ -2420,7 +2455,7 @@ export const App: React.FC = () => {
             return;
         }
 
-        const panelFeedback = matchAndApplyPanelCommand(transcript);
+        const panelFeedback = matchAndApplyPanelCommand(cleanTranscript) || matchAndApplyPanelCommand(transcript);
         if (panelFeedback) {
             speakAndSaveReply(panelFeedback);
             return;
@@ -2774,6 +2809,8 @@ export const App: React.FC = () => {
                 let voicedChunksCount = 0;
                 let silenceChunksCount = 0;
                 let isCapturingUtterance = false;
+                let noiseFloorRms = 180;
+                let utterancePeakRms = 0;
 
                 const handleMicPcmChunk = (int16Data: Int16Array) => {
                     const targetRate = 16000;
@@ -2788,7 +2825,7 @@ export const App: React.FC = () => {
                     if (isLocalMode) {
                         // In Kali Linux / Debian Local Mode, browser webkitSpeechRecognition is often unavailable
                         // or silently dead (Chromium lacks Google Speech API keys, Firefox ESR lacks SpeechRecognition).
-                        // Always use real-time WebAudio VAD to capture Koko's voice utterances and process via /api/local-voice-turn.
+                        // Always use real-time WebAudio VAD with adaptive noise floor to capture Koko's voice utterances.
                         const nexusCurrentlySpeaking =
                             sourcesRef.current.size > 0 ||
                             Date.now() < nexusSpeakingUntilRef.current ||
@@ -2798,36 +2835,54 @@ export const App: React.FC = () => {
                             utteranceChunks = [];
                             voicedChunksCount = 0;
                             silenceChunksCount = 0;
+                            utterancePeakRms = 0;
                             return;
                         }
 
-                        const VOICE_THRESHOLD = 420;
-                        if (rmsInt16 >= VOICE_THRESHOLD) {
+                        const dynamicVoiceThreshold = Math.max(260, Math.min(1300, noiseFloorRms * 1.9 + 110));
+                        if (rmsInt16 >= dynamicVoiceThreshold) {
                             if (!isCapturingUtterance) {
                                 isCapturingUtterance = true;
                                 utteranceChunks = [...preRollChunks];
                                 voicedChunksCount = 0;
+                                utterancePeakRms = rmsInt16;
+                            } else if (rmsInt16 > utterancePeakRms) {
+                                utterancePeakRms = rmsInt16;
                             }
                             utteranceChunks.push(int16Data);
                             voicedChunksCount++;
                             silenceChunksCount = 0;
+
+                            // If steady background fan noise holds above threshold without real speech peaks, adapt floor upward
+                            if (utteranceChunks.length > 45 && utterancePeakRms < dynamicVoiceThreshold * 1.35) {
+                                noiseFloorRms = Math.min(950, noiseFloorRms * 0.7 + rmsInt16 * 0.3);
+                                isCapturingUtterance = false;
+                                utteranceChunks = [];
+                                voicedChunksCount = 0;
+                                silenceChunksCount = 0;
+                                utterancePeakRms = 0;
+                                return;
+                            }
                         } else if (isCapturingUtterance) {
                             utteranceChunks.push(int16Data);
                             silenceChunksCount++;
                         } else {
+                            noiseFloorRms = Math.max(80, Math.min(900, noiseFloorRms * 0.94 + rmsInt16 * 0.06));
                             preRollChunks.push(int16Data);
                             if (preRollChunks.length > 3) preRollChunks.shift();
                         }
 
-                        if (isCapturingUtterance && (silenceChunksCount >= 6 || utteranceChunks.length >= 80)) {
+                        if (isCapturingUtterance && (silenceChunksCount >= 5 || utteranceChunks.length >= 65)) {
                             const captured = utteranceChunks;
                             const voiced = voicedChunksCount;
+                            const peak = utterancePeakRms;
                             isCapturingUtterance = false;
                             utteranceChunks = [];
                             voicedChunksCount = 0;
                             silenceChunksCount = 0;
+                            utterancePeakRms = 0;
 
-                            if (voiced >= 3 && Date.now() - lastVoiceCommandAtRef.current > 1500) {
+                            if (voiced >= 2 && peak >= noiseFloorRms * 1.4 + 90 && Date.now() - lastVoiceCommandAtRef.current > 500) {
                                 localVoiceBusyRef.current = true;
                                 setNexusStatus('THINKING');
                                 const audioWavBase64 = encodeWavFromChunks(captured, targetRate);

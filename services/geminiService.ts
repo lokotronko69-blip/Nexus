@@ -112,6 +112,10 @@ function mergeTranscriptFragments(
         const piece = item.text;
         if (!piece.trim()) continue;
         const prev = merged[merged.length - 1];
+        if (prev && prev.role === item.role && prev.text.trim().toLowerCase() === piece.trim().toLowerCase()) {
+            prev.timestamp = item.timestamp || prev.timestamp;
+            continue;
+        }
         if (prev && prev.role === item.role && Math.abs((item.timestamp || 0) - (prev.timestamp || 0)) < 15000) {
             const needsSpace =
                 prev.text.length > 0 &&

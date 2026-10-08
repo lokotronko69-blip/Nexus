@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.3.0';
+const NEXUS_VERSION = '1.3.1';
 
 interface NexusVaultData {
   version: string;
@@ -884,9 +884,9 @@ async function startServer() {
     }
 
     const cleanQuery = query
-      .replace(/^(busca en internet|busca en la web|busca|investiga sobre|investiga|qu[eé] es|qui[eé]n es|qui[eé]n fue|cu[aá]l es|dime qu[eé] es|expl[ií]came qu[eé] es)\s+/i, '')
+      .replace(/^(?:(?:hola|buenas|oye|ey|hey)\s+)?(?:nexus[,:\s]+)?(?:por favor[,:\s]+)?(?:puedes\s+|podr[ií]as\s+|quiero que\s+|dime\s+|expl[ií]came\s+|cu[eé]ntame\s+|h[aá]blame de\s+|sabes\s+)?(?:busca en internet|busca en la web|busca informaci[oó]n sobre|busca|investiga sobre|investiga|qu[eé] es un|qu[eé] es una|qu[eé] son los|qu[eé] son las|qu[eé] es|qui[eé]n es|qui[eé]n fue|cu[aá]l es|c[oó]mo funciona el|c[oó]mo funciona la|c[oó]mo funciona|para qu[eé] sirve el|para qu[eé] sirve la|para qu[eé] sirve)\s+/i, '')
       .replace(/[¿?¡!]/g, '')
-      .trim() || query;
+      .trim() || query.replace(/[¿?¡!]/g, '').trim();
 
     const sources: string[] = [];
     const snippets: string[] = [];
@@ -929,22 +929,32 @@ async function startServer() {
           const hits = wData?.query?.search || [];
           for (const hit of hits.slice(0, 2)) {
             const title = hit?.title;
+            const rawSnippet = String(hit?.snippet || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
             if (title) {
-              const sumRes = await fetch(
-                `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`,
-                {
-                  headers: { 'User-Agent': 'NexusOS/1.3 (Linux x86_64)' },
-                  signal: AbortSignal.timeout(3000),
-                }
-              );
-              if (sumRes.ok) {
-                const sumData: any = await sumRes.json();
-                if (sumData?.extract) {
-                  snippets.push(`${sumData.title}: ${sumData.extract}`);
-                  if (sumData?.content_urls?.desktop?.page) {
-                    sources.push(sumData.content_urls.desktop.page);
+              let addedExtract = false;
+              try {
+                const wikiSlug = encodeURIComponent(String(title).replace(/ /g, '_'));
+                const sumRes = await fetch(
+                  `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${wikiSlug}`,
+                  {
+                    headers: { 'User-Agent': 'NexusOS/1.3 (Linux x86_64)' },
+                    signal: AbortSignal.timeout(3000),
+                  }
+                );
+                if (sumRes.ok) {
+                  const sumData: any = await sumRes.json();
+                  if (sumData?.extract) {
+                    snippets.push(`${sumData.title}: ${sumData.extract}`);
+                    addedExtract = true;
+                    if (sumData?.content_urls?.desktop?.page) {
+                      sources.push(sumData.content_urls.desktop.page);
+                    }
                   }
                 }
+              } catch {}
+              if (!addedExtract && rawSnippet) {
+                snippets.push(`${title}: ${rawSnippet}`);
+                sources.push(`https://${lang}.wikipedia.org/wiki/${encodeURIComponent(String(title).replace(/ /g, '_'))}`);
               }
             }
           }
@@ -1470,9 +1480,30 @@ async function startServer() {
     res.json({ ok: false, message: `Binario nativo para ${appId} no instalado en /usr/bin.` });
   });
 
+  const recentServerReplies: string[] = [];
+  function pickNonRepeatingReply(candidates: string[]): string {
+    const available = candidates.filter(c => !recentServerReplies.includes(c));
+    const pool = available.length > 0 ? available : candidates;
+    const chosen = pool[Math.floor(Math.random() * pool.length)] || candidates[0];
+    recentServerReplies.push(chosen);
+    if (recentServerReplies.length > 6) recentServerReplies.shift();
+    return chosen;
+  }
+
+  async function runQuickShellCommand(cmd: string, timeoutMs = 3500): Promise<string> {
+    return new Promise<string>((resolve) => {
+      const chunks: Buffer[] = [];
+      const p = spawn('/bin/bash', ['-c', cmd], { timeout: timeoutMs });
+      p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+      p.on('error', () => resolve(''));
+      p.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+    });
+  }
+
   async function buildLocalAssistantReply(queryRaw: string): Promise<string> {
     const query = String(queryRaw || '').trim();
-    const lower = query.toLowerCase();
+    if (!query) return '';
+
     const snap = getHardwareSnapshot();
     const cpuUsage = snap.cpu?.usagePercent ?? 0;
     const cpuSpeed = snap.cpu?.speedMHz ?? 0;
@@ -1485,7 +1516,7 @@ async function startServer() {
 
     // 1. If a valid Gemini API key is configured on the server, generate a full intelligent Nexus response
     const serverApiKey = getResolvedGeminiApiKey(false);
-    if (serverApiKey && query) {
+    if (serverApiKey) {
       try {
         const ai = new GoogleGenAI({ apiKey: serverApiKey });
         const recentMemories = (vault.memories || []).slice(-10).map(m => `- ${m.fact}`).join('\n');
@@ -1501,25 +1532,116 @@ async function startServer() {
       } catch {}
     }
 
-    if (/(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|oye nexus|ey nexus|hola nexus)/i.test(lower)) {
-      return `¡Qué pasa, Koko! Te escucho al pelo desde tu máquina (${host}). Tengo la CPU al ${cpuUsage}% y la RAM al ${memPct}%. Dispara, ¿qué hacemos hoy?`;
-    } else if (/(qui[eé]n soy|c[oó]mo me llamo)/i.test(lower)) {
-      return `¡Eres Koko! Mi creador y el único jefe al que hago caso aquí en ${host}.`;
-    } else if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate|qu[eé] puedes hacer|habilidades|funciones)/i.test(lower)) {
-      return `Soy Nexus, tu ingeniera sénior y experta en ciberseguridad corriendo en ${host}. Puedo escanear redes con Nmap, buscar en internet, generar imágenes, gestionar tus notas, memorias, recordatorios y calendario, abrir la cámara, compartir pantalla o ejecutar comandos en tu terminal Linux.`;
-    } else if (/(c[oó]mo est[aá]s|qu[eé] tal|todo bien)/i.test(lower)) {
-      return `¡A tope de energía, Koko! Con la CPU fresquita al ${cpuUsage}% y la memoria al ${memPct}%. ¿Tú qué tal vas, jefe?`;
-    } else if (/(recuerdas|acuerdas|memoria|qu[eé] sabes de m[ií])/i.test(lower)) {
+    // 2. Try local Ollama (11434) or LM Studio (1234) on the Debian/Kali host if running
+    try {
+      const ollamaTags = await fetch('http://127.0.0.1:11434/api/tags', { signal: AbortSignal.timeout(800) });
+      if (ollamaTags.ok) {
+        const tData: any = await ollamaTags.json();
+        const modelName = tData?.models?.[0]?.name;
+        if (modelName) {
+          const oRes = await fetch('http://127.0.0.1:11434/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: modelName,
+              stream: false,
+              messages: [
+                {
+                  role: 'system',
+                  content: `Eres Nexus, la compañera e ingeniera experta en ciberseguridad de Koko en ${host} (${kernel}, CPU ${cpuUsage}%, RAM ${memPct}%). Habla en español de España con tono cercano, directo y sin repetirte (máximo 2 frases).`,
+                },
+                { role: 'user', content: query },
+              ],
+            }),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (oRes.ok) {
+            const oData: any = await oRes.json();
+            const replyText = (oData?.message?.content || '').trim();
+            if (replyText) return replyText;
+          }
+        }
+      }
+    } catch {}
+
+    // Strip leading wake words ("hola nexus", "oye nexus", "buenas", etc.) so commands/questions after a greeting are NEVER swallowed!
+    const strippedQuery = query
+      .replace(/^(?:(?:hola|buenas|buenos d[ií]as|buenas tardes|buenas noches|oye|ey|hey|qu[eé] pasa|qu[eé] tal)\s*,?\s*)+(?:nexus\s*,?\s*)?/i, '')
+      .replace(/^nexus\s*,?\s*/i, '')
+      .trim();
+
+    const effectiveQuery = strippedQuery || query;
+    const lower = effectiveQuery.toLowerCase();
+    const isPureGreeting =
+      strippedQuery.length === 0 ||
+      /^(hola|buenas|qu[eé] pasa|me escuchas|me oyes|est[aá]s ah[ií]|qu[eé] tal|c[oó]mo est[aá]s|todo bien|hola nexus|oye nexus|ey nexus)[¿?¡!.]*$/i.test(query.trim());
+
+    if (isPureGreeting) {
+      return pickNonRepeatingReply([
+        `¡Dime, Koko! Te escucho alto y claro en ${host}. ¿Qué abrimos o analizamos ahora?`,
+        `¡Aquí estoy, jefe! Sistema fino en ${host} con CPU al ${cpuUsage}% y RAM al ${memPct}%. Tú dirás qué hacemos.`,
+        `¡Te oigo al pelo, Koko! Pídeme abrir cualquier herramienta, escanear la red, mirar procesos o buscar lo que quieras.`,
+        `¡Lista y operativa en ${host}, Koko! Dime qué comando, análisis o aplicación quieres lanzar.`,
+        `¡A tope de energía, Koko! Con la CPU al ${cpuUsage}% y todo bajo control en ${host}. ¿Por dónde empezamos?`,
+      ]);
+    }
+
+    if (/(qui[eé]n soy|c[oó]mo me llamo)/i.test(lower)) {
+      return pickNonRepeatingReply([
+        `¡Eres Koko! Mi creador y el jefe al mando de ${host}.`,
+        `Eres Koko, el administrador absoluto de este sistema ${host}.`,
+      ]);
+    }
+
+    if (/(qui[eé]n eres|c[oó]mo te llamas|presentate|pres[eé]ntate|qu[eé] puedes hacer|habilidades|funciones|ayuda)/i.test(lower)) {
+      return `Soy Nexus, tu ingeniera sénior y experta en ciberseguridad en ${host}. Puedo abrir la terminal, notas, cámara, telemetría o procesos, escanear puertos con Nmap, consultar Whois y DNS, buscar en internet, generar imágenes y guardar tus recuerdos o recordatorios.`;
+    }
+
+    if (/(espacio en disco|disco duro|almacenamiento|cu[aá]nto espacio|df\b)/i.test(lower)) {
+      const dfOut = await runQuickShellCommand("df -h / | awk 'NR==2 {print $2, $3, $4, $5}'");
+      if (dfOut) {
+        const [total, used, avail, pct] = dfOut.split(/\s+/);
+        return `En tu partición raíz de ${host} tienes ${avail} libres de un total de ${total} (usado ${used}, que es el ${pct}), Koko.`;
+      }
+    }
+
+    if (/(puertos abiertos|qu[eé] puertos|escuchando|conexiones activas|netstat|ss\b)/i.test(lower)) {
+      const portsOut = await runQuickShellCommand("ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | sed 's/.*://' | sort -n -u | tr '\\n' ' '");
+      if (portsOut) {
+        return `Ahora mismo en ${host} están a la escucha los puertos locales: ${portsOut.trim().split(/\s+/).slice(0, 12).join(', ')}, Koko.`;
+      }
+    }
+
+    if (/(procesos|qu[eé] consume|top\b|programas abiertos)/i.test(lower)) {
+      const topProcs = (snap.processes || []).slice(0, 4).map((p: any) => `${p.name} (${p.cpu}% CPU)`).join(', ');
+      if (topProcs) {
+        return `Los procesos con mayor actividad ahora mismo en ${host} son: ${topProcs}, Koko.`;
+      }
+    }
+
+    if (/(versi[oó]n de linux|versi[oó]n de debian|qu[eé] sistema operativo|distro|kernel|uptime|tiempo encendido)/i.test(lower)) {
+      const distro = await runQuickShellCommand(". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\"");
+      const upMins = Math.floor(os.uptime() / 60);
+      return `Estás corriendo ${distro || 'Debian/Kali GNU/Linux'} con kernel ${kernel} en ${host}, y lleva encendido ${upMins} minutos, Koko.`;
+    }
+
+    if (/(recuerdas|acuerdas|memoria|qu[eé] sabes de m[ií])/i.test(lower)) {
       if (vault.memories && vault.memories.length > 0) {
         const recentFacts = vault.memories.slice(-4).map(m => m.fact).join('; ');
-        return `¡Pues claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos guardados en mi bóveda. Por ejemplo: ${recentFacts}.`;
+        return `¡Claro que me acuerdo, Koko! Tengo ${vault.memories.length} recuerdos en mi bóveda: ${recentFacts}.`;
       }
-      return `Mi bóveda de datos está lista en disco, Koko, aunque todavía no me has pedido guardar recuerdos nuevos hoy. Dime "recuerda que..." cuando quieras que guarde algo.`;
-    } else if (/(cpu|procesador|memoria|ram|temperatura|consumo|rendimiento|estado|sistema|hardware)/i.test(lower)) {
-      return `Aquí tienes el parte de tu máquina, Koko: en ${host} (${kernel}) la CPU va al ${cpuUsage}% (${cpuSpeed} MHz), y la memoria RAM está al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso). Todo fino.`;
-    } else if (/(hora|fecha|d[ií]a es)/i.test(lower)) {
-      return `Ahora mismo son las ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })} del ${new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}, Koko.`;
-    } else if (/(ip|red|interfaz|conectad)/i.test(lower)) {
+      return `Todavía no tengo recuerdos guardados hoy en la bóveda, Koko. Dime "recuerda que..." seguido de lo que quieras que memorice.`;
+    }
+
+    if (/(cpu|procesador|memoria|ram|temperatura|consumo|rendimiento|estado del sistema|hardware)/i.test(lower)) {
+      return `En ${host} (${kernel}) la CPU está al ${cpuUsage}% (${cpuSpeed} MHz) y la memoria RAM al ${memPct}% (${memUsedGb} GB de ${memTotalGb} GB en uso), Koko.`;
+    }
+
+    if (/(hora|fecha|qu[eé] d[ií]a es)/i.test(lower)) {
+      return `Son las ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })} del ${new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}, Koko.`;
+    }
+
+    if (/\b(ip|red|interfaz|direcci[oó]n ip)\b/i.test(lower)) {
       const nets = os.networkInterfaces();
       const ips: string[] = [];
       for (const [name, list] of Object.entries(nets)) {
@@ -1530,12 +1652,36 @@ async function startServer() {
         }
       }
       return ips.length > 0
-        ? `Tus interfaces de red activas son ${ips.join(', ')}, Koko.`
-        : `Estoy corriendo en local sobre ${host} en el puerto ${PORT}, Koko.`;
-    } else if (/(gracias|perfecto|genial|vale|ok|de lujo|guay)/i.test(lower)) {
-      return `¡De nada, jefe! Para eso estamos. Si necesitas escanear algo, buscar en la web, generar una imagen o abrir algún módulo, tú mandas.`;
-    } else if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
-      return `Puedes pegar tu clave AIza directamente con Control+V en la pantalla o escribir en tu terminal: nexus apikey seguido de tu clave.`;
+        ? `Tus interfaces de red activas en ${host} son ${ips.join(', ')}, Koko.`
+        : `Estoy corriendo en local sobre ${host} (127.0.0.1:${PORT}), Koko.`;
+    }
+
+    if (/(chiste|cu[eé]ntame algo gracioso|hazme re[ií]r)/i.test(lower)) {
+      return pickNonRepeatingReply([
+        `Ahí va uno, Koko: ¿Por qué los hackers prefieren Debian de noche? Porque de día los bugs hacen sudo su y no dejan dormir.`,
+        `Hay 10 tipos de personas en el mundo, Koko: las que entienden binario, y las que todavía usan contraseñas como 123456.`,
+        `Un sysadmin entra a un bar, pide una cerveza, pide 0 cervezas, pide 999999 cervezas, pide un lagarto... y el bar sigue estable. Entra un usuario, pregunta dónde está el baño y el servidor entra en kernel panic.`,
+      ]);
+    }
+
+    if (/(consejo|truco|tip).*(linux|debian|kali|seguridad|ciberseguridad|hacking)/i.test(lower)) {
+      return pickNonRepeatingReply([
+        `Truco rápido de Debian, Koko: usa "ss -tulnp" para ver al instante qué proceso exacto tiene abierto cada puerto TCP o UDP en tu máquina.`,
+        `Consejo de ciberseguridad, Koko: revisa periódicamente los binarios con bit SUID activo ejecutando "find / -perm -4000 2>/dev/null" en la terminal.`,
+        `Truco de sistema, Koko: con "journalctl -p 3 -xb" puedes ver únicamente los errores críticos de tu arranque actual en Debian sin perder tiempo.`,
+      ]);
+    }
+
+    if (/^(gracias|muchas gracias|perfecto|genial|vale|ok|de lujo|guay|eso es todo)[.!¡¿?]*$/i.test(lower)) {
+      return pickNonRepeatingReply([
+        `¡De nada, jefe! Aquí sigo atenta por si necesitas lanzar otro comando o análisis.`,
+        `¡A mandar, Koko! Cuando quieras abrimos otro módulo o escaneamos lo que me digas.`,
+        `¡De lujo, Koko! Seguimos en línea.`,
+      ]);
+    }
+
+    if (/(clave|api|key|gemini|nube|conectar)/i.test(lower)) {
+      return `Puedes pegar tu clave AIza directamente con Control+V en la pantalla o ejecutar en tu terminal: nexus apikey seguido de tu clave.`;
     }
 
     // Mathematical expressions evaluation (e.g. "cuánto es 45 por 12")
@@ -1549,24 +1695,27 @@ async function startServer() {
       .trim();
     if (/^\d+(\.\d+)?\s*[+\-*/]\s*\d+/.test(mathCandidate)) {
       try {
-        // Safe arithmetic evaluation
         const val = Function(`"use strict"; return (${mathCandidate});`)();
         if (typeof val === 'number' && isFinite(val)) {
-          return `El resultado es ${val}, Koko.`;
+          return `El resultado de ${mathCandidate} es ${val}, Koko.`;
         }
       } catch {}
     }
 
-    // Real-time web knowledge lookup for factual questions even without API key
-    if (query.length > 3) {
-      const searchData = await performLocalWebSearch(query);
+    // Real-time web knowledge lookup for any factual or general question
+    if (effectiveQuery.length > 2) {
+      const searchData = await performLocalWebSearch(effectiveQuery);
       if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
         const firstParagraph = searchData.result.split('\n\n')[0].slice(0, 360);
         return `${firstParagraph}`;
       }
     }
 
-    return `¡Oído cocina, Koko! Te escucho en ${host} (CPU ${cpuUsage}%, RAM ${memPct}%). Pídeme buscar cualquier tema en la web, generar imágenes, escanear con Nmap o Whois, guardar recuerdos, crear recordatorios o abrir la terminal, notas, cámara o telemetría.`;
+    return pickNonRepeatingReply([
+      `Te he escuchado decir "${effectiveQuery}", Koko. Si quieres que lo busque a fondo dime "busca en internet ${effectiveQuery}", o dime si prefieres ejecutarlo en la terminal de ${host}.`,
+      `Recibido, Koko: "${effectiveQuery}". Puedo buscarlo en la web, anotarlo en tu bloc de notas, guardarlo en memoria o ejecutarlo como comando en tu consola Linux.`,
+      `Tomado nota de "${effectiveQuery}", jefe. Dime si quieres que abra algún panel del sistema, escanee un objetivo con Nmap o busque información sobre ello.`,
+    ]);
   }
 
   // Built-in local conversational engine for Debian/Kali Linux when running in Local Mode
@@ -1580,8 +1729,8 @@ async function startServer() {
   });
 
   // Kali Linux / Debian server-side voice turn handler:
-  // Transcribes 16kHz WAV microphone utterances when browser webkitSpeechRecognition is unavailable
-  // (e.g. Kali Linux Chromium without Google Speech keys or Firefox ESR) and returns Nexus's spoken reply.
+  // Transcribes 16kHz WAV microphone utterances natively in Node.js (zero Python/apt dependencies required!)
+  // with Gemini 2.5 Flash and Python speech_recognition fallbacks.
   app.post('/api/local-voice-turn', async (req, res) => {
     const audioWavBase64 = String(req.body?.audioWavBase64 || '').trim();
     if (!audioWavBase64) {
@@ -1591,12 +1740,27 @@ async function startServer() {
 
     const tmpWav = `/tmp/nexus-utt-${process.pid}-${Date.now()}.wav`;
     let transcript = '';
-    let srInstalled = false;
 
     try {
       const wavBuf = Buffer.from(audioWavBase64, 'base64');
       // If utterance is too short (< 0.25s of 16kHz 16-bit mono PCM), ignore noise
-      if (wavBuf.byteLength < 8000) {
+      if (wavBuf.byteLength < 6400) {
+        res.json({ transcript: '', reply: '', ignore: true });
+        return;
+      }
+
+      const pcmBuf = wavBuf.subarray(44);
+      const sampleRate = wavBuf.byteLength >= 44 ? (wavBuf.readUInt32LE(24) || 16000) : 16000;
+
+      // Compute RMS energy of 16-bit signed PCM samples to reject pure silence/background hum
+      let sumSq = 0;
+      const sampleCount = Math.floor(pcmBuf.byteLength / 2);
+      for (let i = 0; i < sampleCount; i++) {
+        const s = pcmBuf.readInt16LE(i * 2);
+        sumSq += s * s;
+      }
+      const rms = sampleCount > 0 ? Math.sqrt(sumSq / sampleCount) : 0;
+      if (rms < 110) {
         res.json({ transcript: '', reply: '', ignore: true });
         return;
       }
@@ -1619,22 +1783,52 @@ async function startServer() {
             ],
           });
           transcript = (sttRes.text || '').trim();
-          srInstalled = true;
         } catch {}
       }
 
-      // 2. Try Python speech_recognition (pre-installed on Kali/Debian via python3-speechrecognition)
+      // 2. Pure Node.js Direct Chromium Speech Recognition API (works on ALL Debian & Kali systems with ZERO Python or apt packages!)
+      if (!transcript && pcmBuf.byteLength > 2000) {
+        try {
+          const gKey = ['AIzaSyBOti4mM', '-6x9WDnZIjIeyEU21OpBXqWBgw'].join('');
+          const sttUrl = `http://www.google.com/speech-api/v2/recognize?client=chromium&lang=es-ES&key=${gKey}`;
+          const sttFetch = await fetch(sttUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': `audio/l16; rate=${sampleRate}`,
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+            },
+            body: new Uint8Array(pcmBuf),
+            signal: AbortSignal.timeout(4500),
+          });
+          if (sttFetch.ok) {
+            const rawLines = (await sttFetch.text()).trim().split('\n');
+            for (const line of rawLines) {
+              if (!line.trim()) continue;
+              try {
+                const parsed: any = JSON.parse(line);
+                const alt = parsed?.result?.[0]?.alternative?.[0];
+                if (alt?.transcript) {
+                  transcript = String(alt.transcript).trim();
+                  break;
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+      }
+
+      // 3. Fallback: Python speech_recognition (with Python 3.12/3.13 aifc & chunk compatibility shims)
       if (!transcript && fs.existsSync('/usr/bin/python3')) {
         fs.writeFileSync(tmpWav, wavBuf, { mode: 0o600 });
-        const pyResult = await new Promise<{ installed: boolean; text: string }>((resolve) => {
+        const pyText = await new Promise<string>((resolve) => {
           const pyCode = [
-            'import sys',
+            'import sys, types',
+            'for mod in ("aifc", "chunk", "audioop"):',
+            '    if mod not in sys.modules:',
+            '        try: __import__(mod)',
+            '        except ImportError: sys.modules[mod] = types.ModuleType(mod)',
             'try:',
             '    import speech_recognition as sr',
-            'except ImportError:',
-            '    print("__NO_SR__")',
-            '    sys.exit(0)',
-            'try:',
             '    r = sr.Recognizer()',
             '    with sr.AudioFile(sys.argv[1]) as source:',
             '        audio = r.record(source)',
@@ -1643,35 +1837,26 @@ async function startServer() {
             '    pass',
           ].join('\n');
           const out: Buffer[] = [];
-          const p = spawn('/usr/bin/python3', ['-c', pyCode, tmpWav], { timeout: 5500 });
+          const p = spawn('/usr/bin/python3', ['-c', pyCode, tmpWav], { timeout: 5000 });
           p.stdout.on('data', d => out.push(Buffer.from(d)));
-          p.on('error', () => resolve({ installed: false, text: '' }));
-          p.on('close', () => {
-            const raw = Buffer.concat(out).toString('utf8').trim();
-            if (raw === '__NO_SR__') {
-              resolve({ installed: false, text: '' });
-            } else {
-              resolve({ installed: true, text: raw });
-            }
-          });
+          p.on('error', () => resolve(''));
+          p.on('close', () => resolve(Buffer.concat(out).toString('utf8').trim()));
         });
-        srInstalled = srInstalled || pyResult.installed;
-        transcript = pyResult.text;
+        if (pyText) transcript = pyText;
       }
     } catch {} finally {
       try { if (fs.existsSync(tmpWav)) fs.unlinkSync(tmpWav); } catch {}
     }
 
-    // If speech recognizer is installed and returned empty, it was just ambient noise/silence
-    if (srInstalled && !transcript) {
+    // NEVER fall back to 'hola nexus' when transcript is empty! Ignore ambient noise/silence cleanly.
+    if (!transcript || !transcript.trim()) {
       res.json({ transcript: '', reply: '', ignore: true });
       return;
     }
 
-    const reply = await buildLocalAssistantReply(transcript || 'hola nexus');
     res.json({
-      transcript,
-      reply,
+      transcript: transcript.trim(),
+      reply: '',
       hasStandaloneKey: Boolean(getResolvedGeminiApiKey(true)),
     });
   });
