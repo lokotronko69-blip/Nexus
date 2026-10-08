@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { LiveServerMessage } from '@google/genai';
 import { Monitor, MonitorOff, Video, VideoOff, Brain, Trash2, Settings, Cpu, Activity, Globe, Save, CheckCircle2, AlertCircle, RefreshCw, Terminal, Package, FileText } from 'lucide-react';
-import { connectToNexus, performComplexTask, getWebSearchResult, NexusFunctionDeclarations, executeDynamicCode, generateImage, LiveSession, saveMemoryToStorage, loadMemories, getAllMemoriesFromStorage, getMemoriesArray, deleteMemory, clearAllMemories, executeCyberSecurityTool, saveTranscript, setCurrentNexusVoice, getCurrentNexusVoice, resetToDefaultNexusVoice, synthesizeNexusVoice, DEFAULT_NEXUS_VOICE } from './services/geminiService';
+import { connectToNexus, performComplexTask, getWebSearchResult, NexusFunctionDeclarations, executeDynamicCode, generateImage, LiveSession, saveMemoryToStorage, loadMemories, getAllMemoriesFromStorage, getMemoriesArray, deleteMemory, clearAllMemories, executeCyberSecurityTool, saveTranscript, setCurrentNexusVoice, getCurrentNexusVoice, resetToDefaultNexusVoice, synthesizeNexusVoice, ensureWindowNexusCoreMethods, DEFAULT_NEXUS_VOICE } from './services/geminiService';
 import type { NexusStatus } from './types';
 import { VoiceVisualizer } from './components/VoiceVisualizer';
 import { DrawingCanvas } from './components/DrawingCanvas';
@@ -401,7 +401,9 @@ export const App: React.FC = () => {
     // Resume audio contexts on user interaction
     useEffect(() => {
         // Setup global nexus helper for tools
+        ensureWindowNexusCoreMethods();
         (window as any).nexus = {
+            ...((window as any).nexus || {}),
             createTool: (id: string, html: string, title: string = 'Herramienta') => {
                 const container = document.getElementById('nexus-tools-container');
                 if (!container) return null;
@@ -755,7 +757,10 @@ export const App: React.FC = () => {
                         }
                         if (ctx && analyser) {
                             if (ctx.state === 'suspended') {
-                                await ctx.resume().catch(() => {});
+                                await Promise.race([
+                                    ctx.resume().catch(() => {}),
+                                    new Promise(resolve => setTimeout(resolve, 120))
+                                ]);
                             }
                             const decoded = await ctx.decodeAudioData(wavBuf.slice(0));
                             const src = ctx.createBufferSource();
@@ -824,8 +829,13 @@ export const App: React.FC = () => {
                     });
                 };
 
-                // Always prioritize Nexus's fixed Kore voice via Gemini TTS when online
-                if (navigator.onLine) {
+                // On localhost (Debian/Kali Linux), /api/local-tts handles both Gemini Kore TTS (if key configured)
+                // and Microsoft Edge Neural Spanish Young Female voice (es-ES-XimenaNeural) in ~650ms.
+                const isLocalLinuxHost =
+                    typeof window !== 'undefined' &&
+                    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+                if (navigator.onLine && !isLocalLinuxHost) {
                     synthesizeNexusVoice(cleanText)
                         .then(b64 => {
                             if (b64 && playPcm24kChunk(b64)) {
@@ -855,6 +865,7 @@ export const App: React.FC = () => {
                 setNexusStatus('LISTENING');
             }
         };
+        ensureWindowNexusCoreMethods();
 
         const resumeAudio = () => {
             if (inputAudioContextRef.current && inputAudioContextRef.current.state === 'suspended') {
@@ -2966,11 +2977,43 @@ export const App: React.FC = () => {
                 startOfflineRecognition();
                 if (!localGreetedRef.current) {
                     localGreetedRef.current = true;
-                    setTimeout(() => {
+                    setTimeout(async () => {
+                        let greeting = "¡Qué pasa Koko, rey! Ya estoy aquí contigo en tu Kali Linux, lista y con todos nuestros recuerdos del vídeo de YouTube y DaVinci Resolve al pelo. ¡Dime a qué le damos caña, jefe!";
+                        try {
+                            const res = await fetch('/api/local-assistant', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    query: 'Acabo de iniciarte en mi Kali Linux. Salúdame como Koko con toda tu personalidad cañera de chica de barrio española, confirma que me escuchas al pelo y menciona brevemente nuestro proyecto del vídeo de YouTube.',
+                                }),
+                                signal: AbortSignal.timeout(2400),
+                            });
+                            if (res.ok) {
+                                const data = await res.json();
+                                if (data?.reply && String(data.reply).trim().length > 10) {
+                                    greeting = String(data.reply).trim();
+                                }
+                            }
+                        } catch {}
+                        saveTranscript(greeting, 'model');
                         if ((window as any).nexus?.speak) {
-                            (window as any).nexus.speak("¡Ya estoy aquí en tu Kali Linux, Koko! Te escucho alto y claro.");
+                            (window as any).nexus.speak(greeting);
                         }
-                    }, 350);
+                    }, 250);
+                }
+            } else if (!localGreetedRef.current) {
+                const isLocalHost =
+                    typeof window !== 'undefined' &&
+                    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+                if (isLocalHost && sessionRef.current && typeof sessionRef.current.sendRealtimeInput === 'function') {
+                    localGreetedRef.current = true;
+                    setTimeout(() => {
+                        try {
+                            sessionRef.current?.sendRealtimeInput({
+                                text: 'Acabo de iniciarte en mi Kali Linux, Nexus. Salúdame como Koko con toda tu energía y personalidad cañera, confirma que estás lista y menciona brevemente lo que teníamos entre manos.',
+                            });
+                        } catch {}
+                    }, 300);
                 }
             }
 

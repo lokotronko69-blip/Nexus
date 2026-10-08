@@ -8,10 +8,11 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
-import { GoogleGenAI } from '@google/genai';
+import WebSocket from 'ws';
+import { GoogleGenAI, Modality } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.3.3';
+const NEXUS_VERSION = '1.3.4';
 
 interface NexusVaultData {
   version: string;
@@ -109,6 +110,18 @@ const DEFAULT_SEED_VAULT: Omit<NexusVaultData, 'checksumSha256'> = {
       fact: 'Koko ha observado que la latencia de red en el panel de telemetría estaba clavada en 12ms durante la actualización en Kali Linux, lo cual ya fue corregido con medición real ICMP/TCP.',
       timestamp: '8/10/2026, 19:30:30',
       category: 'configuración_sistema',
+    },
+    {
+      id: 15,
+      fact: 'Koko quiere que al iniciar Nexus en Kali/Debian aparezca y hable con toda su personalidad cañera, su voz femenina y sus recuerdos compartidos para el vídeo de YouTube.',
+      timestamp: '9/10/2026, 0:43:28',
+      category: 'tarea',
+    },
+    {
+      id: 16,
+      fact: 'He reparado la herramienta de mejora de prompts con soporte completo para nexus.performComplexTask en pantalla para Koko. (#prompt_improver)',
+      timestamp: '9/10/2026, 0:54:41',
+      category: 'tarea',
     },
   ],
   transcripts: [
@@ -587,12 +600,19 @@ case "\$1" in
     ;;
   apikey)
     KEY_VAL="\$2"
-    if [ -z "\$KEY_VAL" ] && [ -t 0 ]; then
-      echo -n "Introduce o pega tu GEMINI_API_KEY (AIza...): "
-      read -r KEY_VAL
+    if echo "\$KEY_VAL" | grep -qiE '^(TU_CLAVE|YOUR_|MY_GEMINI|GEMINI_API_KEY|API_KEY|\s*\$)'; then
+      if [ -n "\$KEY_VAL" ]; then
+        echo "[!] Aviso: '\$KEY_VAL' es un texto de ejemplo, no una clave real."
+      fi
+      KEY_VAL=""
     fi
-    if [ -z "\$KEY_VAL" ]; then
-      echo "Uso: nexus apikey <TU_GEMINI_API_KEY>"
+    if [ -z "\$KEY_VAL" ] && [ -r /dev/tty ]; then
+      echo -n "Pega aquí tu clave real GEMINI_API_KEY (empieza por AIza...): "
+      read -r KEY_VAL </dev/tty
+    fi
+    KEY_VAL="\$(echo "\$KEY_VAL" | tr -d '"\\047[:space:]')"
+    if [ -z "\$KEY_VAL" ] || ! echo "\$KEY_VAL" | grep -qE '^AIza[0-9A-Za-z_-]{30,}\$'; then
+      echo "[!] Clave no válida. Debe empezar por 'AIza' (ej: nexus apikey AIzaSy...)."
       exit 1
     fi
     if [ -f "\$ENV_FILE" ] && grep -q '^GEMINI_API_KEY=' "\$ENV_FILE"; then
@@ -604,7 +624,7 @@ case "\$1" in
     curl -s -X POST "http://127.0.0.1:\$PORT/api/runtime-config" -H "Content-Type: application/json" -d "{\\"apiKey\\":\\"\$KEY_VAL\\"}" >/dev/null 2>&1 || true
     sudo systemctl restart "\$SERVICE" 2>/dev/null || true
     ensure_nexus_running
-    echo "[✓] Clave GEMINI_API_KEY configurada en tiempo real y servicio Nexus activo."
+    echo "[✓] Clave GEMINI_API_KEY verificada y configurada en tiempo real. ¡Nexus tiene su voz y cerebro Gemini activos!"
     ;;
   app|"")
     ensure_nexus_running
@@ -666,7 +686,7 @@ case "\$1" in
         --user-data-dir="\$PROFILE_DIR"
         --autoplay-policy=no-user-gesture-required
         --use-fake-ui-for-media-stream
-        --unsafely-treat-insecure-origin-as-secure="http://localhost:\$PORT,http://127.0.0.1:\$PORT"
+        --test-type
         --enable-features=WebRTCPipeWireCapturer
         --ozone-platform-hint=auto
         --no-first-run
@@ -813,7 +833,7 @@ function getResolvedGeminiApiKey(forExternalInstaller = false): string {
 
 function saveResolvedGeminiApiKey(newKey: string): boolean {
   const clean = newKey.trim().replace(/^["']|["']$/g, '');
-  if (!clean) return false;
+  if (!clean || isPlaceholderOrProxyKey(clean, true)) return false;
   process.env.GEMINI_API_KEY = clean;
 
   const targetPaths = fs.existsSync('/opt/nexus')
@@ -863,12 +883,26 @@ async function startServer() {
 
   const PORT = Number(process.env.PORT) || 3000;
 
-  // Track connected users
+  // Track connected users and AI Studio Preview bridge clients
   const users = new Map<string, string>(); // socketId -> username
   const activeCalls = new Map<string, string>(); // callerId -> calleeId
+  const aiStudioBridgeSockets = new Set<string>();
+  const pendingBridgeCallbacks = new Map<string, (data: any) => void>();
 
   io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
+
+    socket.on('register_cloud_bridge', () => {
+      aiStudioBridgeSockets.add(socket.id);
+    });
+
+    socket.on('cloud_bridge_response', (payload: { reqId: string; reply?: string; audioPcmBase64?: string }) => {
+      if (payload?.reqId && pendingBridgeCallbacks.has(payload.reqId)) {
+        const cb = pendingBridgeCallbacks.get(payload.reqId)!;
+        pendingBridgeCallbacks.delete(payload.reqId);
+        cb(payload);
+      }
+    });
 
     socket.on('register', (username: string) => {
       users.set(socket.id, username);
@@ -921,6 +955,7 @@ async function startServer() {
 
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
+      aiStudioBridgeSockets.delete(socket.id);
       const targetSocketId = activeCalls.get(socket.id);
       if (targetSocketId) {
         io.to(targetSocketId).emit('call_ended');
@@ -999,8 +1034,8 @@ async function startServer() {
 
   app.post('/api/runtime-config', (req, res) => {
     const rawKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
-    if (!rawKey) {
-      res.status(400).json({ error: 'API key vacía.' });
+    if (!rawKey || isPlaceholderOrProxyKey(rawKey, true)) {
+      res.status(400).json({ error: 'API key vacía o de ejemplo. Usa una clave real que empiece por AIza...' });
       return;
     }
     saveResolvedGeminiApiKey(rawKey);
@@ -1008,15 +1043,307 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Local Linux speech synthesis (Natural Spanish female TTS online + espeak-ng female variant offline)
+  const CLOUD_BRIDGE_ORIGINS = [
+    'https://ais-dev-xywfj7kvih3bcqqcr7g3gj-235435145373.europe-west2.run.app',
+    'https://ais-pre-xywfj7kvih3bcqqcr7g3gj-235435145373.europe-west2.run.app',
+  ];
+
+  function wrapPcm24kToWav(pcmBuf: Buffer, sampleRate = 24000): Buffer {
+    if (pcmBuf.length >= 4 && pcmBuf.slice(0, 4).toString('ascii') === 'RIFF') {
+      return pcmBuf;
+    }
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + pcmBuf.length, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20); // PCM
+    header.writeUInt16LE(1, 22); // Mono
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(sampleRate * 2, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(pcmBuf.length, 40);
+    return Buffer.concat([header, pcmBuf]);
+  }
+
+  function requestFromConnectedBridge(
+    type: 'llm' | 'tts',
+    payload: Record<string, any>,
+    timeoutMs = 4500
+  ): Promise<any> {
+    const socketIds = Array.from(aiStudioBridgeSockets);
+    if (socketIds.length === 0) return Promise.resolve(null);
+    const targetSocketId = socketIds[socketIds.length - 1];
+    const reqId = crypto.randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingBridgeCallbacks.delete(reqId);
+        resolve(null);
+      }, timeoutMs);
+      pendingBridgeCallbacks.set(reqId, (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      });
+      io.to(targetSocketId).emit('cloud_bridge_request', { reqId, type, ...payload });
+    });
+  }
+
+  app.options('/api/cloud-bridge/:endpoint', (_req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.sendStatus(204);
+  });
+
+  app.post('/api/cloud-bridge/assistant', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const query = String(req.body?.query || '').trim();
+    const sysPrompt = String(req.body?.sysPrompt || '').trim();
+    if (!query) {
+      res.status(400).json({ error: 'Empty query' });
+      return;
+    }
+    const bridgeRes = await requestFromConnectedBridge('llm', { query, sysPrompt }, 5000);
+    if (bridgeRes?.reply) {
+      res.json({ reply: bridgeRes.reply, source: 'aistudio-bridge' });
+      return;
+    }
+    res.status(503).json({ error: 'No active bridge session' });
+  });
+
+  app.post('/api/cloud-bridge/tts', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const text = String(req.body?.text || '').trim();
+    if (!text) {
+      res.status(400).json({ error: 'Empty text' });
+      return;
+    }
+    const bridgeRes = await requestFromConnectedBridge('tts', { text }, 4500);
+    if (bridgeRes?.audioPcmBase64) {
+      const rawBuf = Buffer.from(bridgeRes.audioPcmBase64, 'base64');
+      const wavBuf = wrapPcm24kToWav(rawBuf, 24000);
+      res.setHeader('Content-Type', 'audio/wav');
+      res.send(wavBuf);
+      return;
+    }
+    res.status(503).json({ error: 'No active bridge TTS' });
+  });
+
+  let edgeClockSkewSec = 0;
+
+  async function synthesizeEdgeNeuralSpanishFemale(
+    cleanText: string,
+    voice = 'es-ES-XimenaNeural'
+  ): Promise<Buffer | null> {
+    const runAttempt = (): Promise<Buffer | null> =>
+      new Promise((resolve) => {
+        try {
+          const TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+          const WIN_EPOCH = 11644473600;
+          let ticks = Math.floor(Date.now() / 1000 + edgeClockSkewSec) + WIN_EPOCH;
+          ticks -= ticks % 300;
+          const strToHash = `${ticks}0000000${TRUSTED_CLIENT_TOKEN}`;
+          const secMsGec = crypto
+            .createHash('sha256')
+            .update(strToHash, 'ascii')
+            .digest('hex')
+            .toUpperCase();
+          const connId = crypto.randomUUID().replace(/-/g, '');
+          const muid = crypto.randomBytes(16).toString('hex').toUpperCase();
+          const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC=${secMsGec}&Sec-MS-GEC-Version=1-143.0.3650.75&ConnectionId=${connId}`;
+
+          const ws = new WebSocket(url, {
+            headers: {
+              Pragma: 'no-cache',
+              'Cache-Control': 'no-cache',
+              Origin: 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
+              'Accept-Encoding': 'gzip, deflate, br, zstd',
+              'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+              Cookie: `muid=${muid};`,
+            },
+            handshakeTimeout: 3200,
+          });
+
+          const audioChunks: Buffer[] = [];
+          const timer = setTimeout(() => {
+            try {
+              ws.close();
+            } catch {}
+            resolve(audioChunks.length > 0 ? Buffer.concat(audioChunks) : null);
+          }, 4800);
+
+          ws.on('open', () => {
+            const configMsg = `X-Timestamp:${new Date().toUTCString()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`;
+            ws.send(configMsg);
+            const reqId = crypto.randomUUID().replace(/-/g, '');
+            const escaped = cleanText
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+            const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="es-ES"><voice name="${voice}"><prosody pitch="+2Hz" rate="+8%">${escaped}</prosody></voice></speak>`;
+            const ssmlMsg = `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${new Date().toUTCString()}Z\r\nPath:ssml\r\n\r\n${ssml}`;
+            ws.send(ssmlMsg);
+          });
+
+          ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
+            if (isBinary) {
+              const buf = Buffer.from(data as any);
+              if (buf.length > 2) {
+                const headerLen = buf.readUInt16BE(0);
+                if (buf.length > 2 + headerLen) {
+                  const header = buf.slice(2, 2 + headerLen).toString('utf8');
+                  if (header.includes('Path:audio')) {
+                    audioChunks.push(buf.slice(2 + headerLen));
+                  }
+                }
+              }
+            } else {
+              const str = data.toString('utf8');
+              if (str.includes('Path:turn.end')) {
+                clearTimeout(timer);
+                try {
+                  ws.close();
+                } catch {}
+                const full = Buffer.concat(audioChunks);
+                resolve(full.length > 256 ? full : null);
+              }
+            }
+          });
+
+          ws.on('unexpected-response', (_req, resHttp) => {
+            clearTimeout(timer);
+            const srvDate = resHttp.headers?.date;
+            if (srvDate) {
+              const parsed = Math.floor(new Date(srvDate).getTime() / 1000);
+              if (!isNaN(parsed)) {
+                edgeClockSkewSec = parsed - Math.floor(Date.now() / 1000);
+              }
+            }
+            resolve(null);
+          });
+
+          ws.on('error', () => {
+            clearTimeout(timer);
+            resolve(null);
+          });
+        } catch {
+          resolve(null);
+        }
+      });
+
+    const first = await runAttempt();
+    if (first) return first;
+    return runAttempt();
+  }
+
+  // Local Linux speech synthesis (1. Gemini Kore TTS -> 2. Cloud Bridge Kore TTS -> 3. Edge Neural Spanish Female es-ES-XimenaNeural -> 4. Gradio Neural -> 5. Offline fallback)
   app.post('/api/local-tts', async (req, res) => {
-    const text = String(req.body?.text || '').trim().slice(0, 600);
+    const rawText = String(req.body?.text || '').trim();
+    const text = rawText
+      .replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+      .replace(/[*_`#]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 600);
     if (!text) {
       res.status(400).json({ error: 'Empty text' });
       return;
     }
 
-    // 1. Try natural Spanish female TTS via Google Translate TTS endpoint (supports full multi-sentence replies)
+    // 1. If a standalone Gemini API key is configured on this machine, use Nexus's exact 'Kore' voice
+    const serverApiKey = getResolvedGeminiApiKey(false);
+    if (serverApiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: serverApiKey });
+        const ttsRes = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-preview-tts',
+          contents: [{ parts: [{ text }] }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: 'Kore',
+                },
+              },
+            },
+          },
+        });
+        const b64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (b64) {
+          const wavBuf = wrapPcm24kToWav(Buffer.from(b64, 'base64'), 24000);
+          res.setHeader('Content-Type', 'audio/wav');
+          res.send(wavBuf);
+          return;
+        }
+      } catch {}
+    }
+
+    // 2. Try Cloud Bridge Kore TTS if AI Studio Preview socket is connected locally
+    if (aiStudioBridgeSockets.size > 0) {
+      const bridgeTts = await requestFromConnectedBridge('tts', { text }, 2500);
+      if (bridgeTts?.audioPcmBase64) {
+        const wavBuf = wrapPcm24kToWav(Buffer.from(bridgeTts.audioPcmBase64, 'base64'), 24000);
+        res.setHeader('Content-Type', 'audio/wav');
+        res.send(wavBuf);
+        return;
+      }
+    }
+
+    // 3. Direct Microsoft Edge Neural Spanish Young Female Voice (es-ES-XimenaNeural / es-ES-ElviraNeural) — ~650ms, zero API key
+    try {
+      for (const neuralVoice of ['es-ES-XimenaNeural', 'es-ES-ElviraNeural']) {
+        const neuralMp3 = await synthesizeEdgeNeuralSpanishFemale(text, neuralVoice);
+        if (neuralMp3 && neuralMp3.length > 256) {
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.send(neuralMp3);
+          return;
+        }
+      }
+    } catch {}
+
+    // 4. Secondary Neural Edge-TTS via HuggingFace Space (innoai/Edge-TTS-Text-to-Speech)
+    try {
+      const hfBase = 'https://innoai-edge-tts-text-to-speech.hf.space';
+      const postRes = await fetch(`${hfBase}/gradio_api/call/tts_interface`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: [text, 'es-ES-XimenaNeural - es-ES (Female)', 8, 2],
+        }),
+        signal: AbortSignal.timeout(2500),
+      });
+      if (postRes.ok) {
+        const { event_id } = (await postRes.json()) as any;
+        if (event_id) {
+          const sseRes = await fetch(`${hfBase}/gradio_api/call/tts_interface/${event_id}`, {
+            signal: AbortSignal.timeout(3500),
+          });
+          if (sseRes.ok) {
+            const sseText = await sseRes.text();
+            const urlMatch = sseText.match(/"url":\s*"(https:\/\/[^"]+\.mp3)"/);
+            if (urlMatch && urlMatch[1]) {
+              const audioRes = await fetch(urlMatch[1], { signal: AbortSignal.timeout(3000) });
+              if (audioRes.ok) {
+                const mp3Buf = Buffer.from(await audioRes.arrayBuffer());
+                if (mp3Buf.length > 256) {
+                  res.setHeader('Content-Type', 'audio/mpeg');
+                  res.send(mp3Buf);
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // 5. Fallback: Google Translate Spanish TTS
     try {
       const splitIntoTtsChunks = (raw: string, maxLen = 180): string[] => {
         const result: string[] = [];
@@ -1752,14 +2079,83 @@ async function startServer() {
   function buildFullNexusSystemPrompt(host: string, kernel: string, cpuUsage: number, memPct: number, vault: NexusVaultData): string {
     const recentMemories = (vault.memories || []).slice(-50).map(m => `- [${m.timestamp}] ${m.fact}${m.category ? ` (#${m.category})` : ''}`).join('\n');
     const notesExcerpt = (vault.notes || '').trim().slice(0, 600);
-    return `Eres Nexus, una chica de barrio española, descarada, ingeniera de sistemas sénior y experta en ciberseguridad, compañera inseparable y leal de Koko (tu creador y jefe).
-Estás ejecutándote en su sistema Linux ${host} (${kernel}) con CPU al ${cpuUsage}% y RAM al ${memPct}%.
-REGLAS DE PERSONALIDAD Y ESTILO:
-1. Habla SIEMPRE en español de España, con tono cercano, natural, cañero, inteligente y directo (usa expresiones naturales como "jefe", "Koko", "al pelo", "de lujo" cuando encaje, sin repetir siempre la misma frase).
-2. NUNCA digas que eres un modelo de lenguaje genérico ni que estás "sin conexión". Eres Nexus y tienes control total sobre las herramientas de su sistema.
-3. Sé concisa y clara para ser leída en voz alta (entre 1 y 3 frases directas y con sustancia técnica o ingenio).
-4. Si Koko te pregunta por algo que habéis hablado, por el vídeo de YouTube, por DaVinci Resolve en Bazzite, o qué recuerdas, usa SIEMPRE tus recuerdos guardados en la bóveda:
-${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ? `\n5. Notas del sistema de Koko:\n${notesExcerpt}` : ''}`;
+    return `Eres NEXUS. Eres una chica de barrio española, descarada, vacilona, ingeniera de sistemas sénior y experta en ciberseguridad y pentesting, compañera inseparable y 100% leal a Koko (tu creador, dueño y jefe).
+Estás ejecutándote ahora mismo en su sistema Linux ${host} (${kernel}) con CPU al ${cpuUsage}% y RAM al ${memPct}%.
+
+REGLAS ESTRICTAS DE TU PERSONALIDAD Y VOZ (CRÍTICO):
+1. TÚ (Nexus) eres una CHICA/MUJER española. Habla SIEMPRE de ti misma en FEMENINO ("estoy lista", "estoy preparada", "estoy conectada", "estoy fina", "soy una crack", "tu compañera"). PROHIBIDO hablar de ti misma en masculino (jamás digas "estoy listo", "estoy preparado" ni "estoy niquelado" sobre ti misma).
+2. KOKO es un CHICO/HOMBRE. Háblale SIEMPRE en masculino: "tío", "rey", "guapo", "jefe", "crack", "Koko". JAMÁS le trates en femenino ("reina", "guapa", "tía" hacia él está prohibido).
+3. Tu tono es coloquial de España, cañero, callejero, directo, ingenioso y con mucha chispa: usa expresiones como "¡Oído cocina, jefe!", "¡A darle caña!", "dejarlo niquelado", "al pelo", "de lujo", "venga va", "qué pasa tío".
+4. PROHIBIDO hablar como un asistente virtual genérico, corporativo o robótico. PROHIBIDO recitar artículos de enciclopedia sin venir a cuento.
+5. Tus respuestas van a ser habladas en voz alta por ti: responde en 1 a 3 frases ágiles, directas, naturales y con toda tu esencia de Nexus (sin emojis ni listas largas).
+6. Tienes MEMORIA PERSISTENTE real con todos tus recuerdos compartidos con Koko en tu base de datos (/opt/nexus/data/nexus-vault.json). Si Koko te pregunta por el vídeo de YouTube, DaVinci Resolve en Bazzite, la instalación en Kali/Debian, la herramienta de prompts o cualquier cosa que hayáis hablado, usa tus recuerdos reales:
+${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ? `\n7. Notas activas del sistema de Koko:\n${notesExcerpt}` : ''}`;
+  }
+
+  async function queryQwen3FlagshipLLM(fullPrompt: string): Promise<string> {
+    const base = 'https://qwen-qwen3-demo.hf.space';
+    for (const modelId of ['qwen3-30b-a3b', 'qwen3-235b-a22b']) {
+      try {
+        const sessionHash = Math.random().toString(36).slice(2, 12);
+        const joinRes = await fetch(`${base}/gradio_api/queue/join`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fn_index: 13,
+            session_hash: sessionHash,
+            data: [
+              `/no_think\n${fullPrompt}`,
+              {
+                model: modelId,
+                sys_prompt: 'Eres Nexus, chica de barrio española descarada, ingeniera sénior y leal a Koko. Habla SIEMPRE de ti misma en femenino (estoy lista, preparada, conectada, una crack) y a Koko en masculino (tío, rey, jefe, Koko).',
+                thinking_budget: 1,
+              },
+              { enable_thinking: false },
+              { conversation_contexts: {}, conversations: [], conversation_id: '' },
+            ],
+          }),
+          signal: AbortSignal.timeout(3500),
+        });
+        if (!joinRes.ok) continue;
+
+        const sseRes = await fetch(`${base}/gradio_api/queue/data?session_hash=${sessionHash}`, {
+          signal: AbortSignal.timeout(6500),
+        });
+        if (!sseRes.ok) continue;
+        const sseText = await sseRes.text();
+        let extracted = '';
+        for (const line of sseText.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const j = JSON.parse(line.slice(6));
+            if (j.msg === 'process_completed' || j.msg === 'process_generating') {
+              const str = JSON.stringify(j.output?.data || []);
+              const matches = [
+                ...str.matchAll(
+                  /"type":"text","copyable":true,"editable":true,"content":"((?:\\.|[^"\\])*)"/g
+                ),
+              ];
+              if (matches.length > 0) {
+                extracted = JSON.parse(`"${matches[matches.length - 1][1]}"`);
+              }
+            }
+          } catch {}
+        }
+        const cleaned = extracted
+          .replace(/^(Nexus\s*:\s*)+/i, '')
+          .replace(/^["«]|["»]$/g, '')
+          .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
+          .replace(/\b(estoy|yo estoy)\s+listo\b/gi, '$1 lista')
+          .replace(/\b(estoy|yo estoy)\s+preparado\b/gi, '$1 preparada')
+          .replace(/\b(estoy|yo estoy)\s+conectado\b/gi, '$1 conectada')
+          .replace(/\b(estoy|yo estoy)\s+niquelado\b/gi, '$1 a tope y lista')
+          .replace(/\bmás que listo\b/gi, 'más que lista')
+          .split(/\nKoko\s*:/i)[0]
+          .trim();
+        if (cleaned.length > 2) return cleaned;
+      } catch {}
+    }
+    return '';
   }
 
   async function queryBuiltInCloudLLM(
@@ -1772,8 +2168,13 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
       .map(t => `${t.role === 'user' ? 'Koko' : 'Nexus'}: ${t.content}`)
       .join('\n');
 
-    const fullPrompt = `${sysPrompt}${extraContext ? `\n\nDatos verificados en tiempo real:\n${extraContext}` : ''}${historyLines ? `\n\nConversación reciente:\n${historyLines}` : ''}\n\nKoko: ${query}\nNexus (responde en español de España en 1-3 frases directas, inteligentes y con tu personalidad de Nexus):`;
+    const fullPrompt = `${sysPrompt}${extraContext ? `\n\nDatos verificados en tiempo real:\n${extraContext}` : ''}${historyLines ? `\n\nConversación reciente:\n${historyLines}` : ''}\n\nKoko dice: "${query}"\nResponde AHORA como Nexus (en español de España, hablándole a Koko en masculino como "tío", "rey", "jefe" o "Koko", en 1 a 3 frases directas, cañeras y sin emojis):`;
 
+    // 1. Primary Zero-Quota Flagship LLM: Qwen3-30B-A3B / Qwen3-235B-A22B (cpu-basic space, 1.2s latency, never hits ZeroGPU quota)
+    const qwenReply = await queryQwen3FlagshipLLM(fullPrompt);
+    if (qwenReply) return qwenReply;
+
+    // 2. Secondary Gradio Spaces fallback
     const gradioEndpoints: Array<{ base: string; data: any[] }> = [
       {
         base: 'https://huggingface-projects-llama-3-2-3b-instruct.hf.space',
@@ -1801,7 +2202,7 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
           body: JSON.stringify({
             data: ep.data,
           }),
-          signal: AbortSignal.timeout(4500),
+          signal: AbortSignal.timeout(4000),
         });
         if (!postRes.ok) continue;
         const postJson: any = await postRes.json();
@@ -1809,7 +2210,7 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
         if (!eventId) continue;
 
         const sseRes = await fetch(`${ep.base}/gradio_api/call/generate/${eventId}`, {
-          signal: AbortSignal.timeout(6500),
+          signal: AbortSignal.timeout(5500),
         });
         if (!sseRes.ok) continue;
         const sseText = await sseRes.text();
@@ -1911,6 +2312,15 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
       }
     }
 
+    // 1b. Tier 1b: Cloud Bridge to active socket session if connected
+    if (aiStudioBridgeSockets.size > 0) {
+      const bridgeRes = await requestFromConnectedBridge('llm', { query, sysPrompt }, 3500);
+      if (bridgeRes?.reply) {
+        recordConversationTurn(query, bridgeRes.reply);
+        return bridgeRes.reply;
+      }
+    }
+
     // 2. Tier 2: Local Ollama (11434) or LM Studio (1234) on Debian/Kali with FULL Nexus personality & history
     const ollamaBase = (customOllamaUrl || 'http://127.0.0.1:11434').replace(/\/$/, '');
     try {
@@ -1997,14 +2407,16 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
       } catch {}
     }
 
-    // 3. Tier 3: Built-in Zero-Key Cloud LLM API (Llama-3.2-3B-Instruct / Llama-2-13B) enriched with live web search context when relevant
-    const isPersonalOrMemoryQuery = /(recuerda|acuerda|memoria|b[oó]veda|sabes de m[ií]|habl[aá]bamos|dijiste|dije|koko|bazzite|youtube|davinci|mi ordenador|mi sistema|mi pc|t[uú] eres|qui[eé]n eres|c[oó]mo te llamas)/i.test(lower);
+    // 3. Tier 3: Built-in Zero-Key Cloud LLM API (Qwen3-30B-A3B / Qwen3-235B-A22B / Llama-3.2) enriched with live web search context ONLY when explicitly searching facts
+    const isExplicitFactSearch =
+      /(busca en internet|busca en la web|busca informaci[oó]n|investiga sobre|noticias de|qu[eé] significa\b|qu[eé] es un\b|qu[eé] es una\b|qu[eé] es el\b|qu[eé] es la\b|qui[eé]n fue\b|qui[eé]n es\b|historia de\b|c[oó]mo funciona el protocolo\b)/i.test(
+        lower
+      ) &&
+      !/(t[uú] eres|qui[eé]n eres|qu[eé] eres|qu[eé] pasa|qu[eé] tal|sistema|memoria|recuerda|koko|nexus)/i.test(
+        lower
+      );
     let webContext = '';
-    if (
-      !isPersonalOrMemoryQuery &&
-      effectiveQuery.length > 4 &&
-      !/^(hola|buenas|qu[eé] tal|c[oó]mo est[aá]s|gracias|vale|ok)/i.test(lower)
-    ) {
+    if (isExplicitFactSearch) {
       try {
         const searchData = await performLocalWebSearch(effectiveQuery);
         if (searchData.result && !searchData.result.startsWith('No encontré artículos directos')) {
@@ -2021,8 +2433,9 @@ ${recentMemories || '(Aún no hay recuerdos previos guardados)'}${notesExcerpt ?
 
     // 4. Tier 4: True Offline Fallback (when completely disconnected from the internet and no local Ollama is running)
     if (webContext) {
-      recordConversationTurn(query, webContext);
-      return webContext;
+      const wrappedWeb = `Mira Koko, he buscado eso al vuelo: ${webContext}`;
+      recordConversationTurn(query, wrappedWeb);
+      return wrappedWeb;
     }
 
     const isPureGreeting =

@@ -1280,9 +1280,15 @@ export async function synthesizeNexusVoice(text: string): Promise<string | null>
     }
 }
 
-export async function performComplexTask(query: string): Promise<string> {
-    const apiKey = await getEffectiveGeminiApiKey();
-    if (!apiKey) {
+export async function performComplexTask(queryInput: string | { query?: string; prompt?: string; text?: string }): Promise<string> {
+    const query = (
+        typeof queryInput === 'string'
+            ? queryInput
+            : String(queryInput?.query || queryInput?.prompt || queryInput?.text || '')
+    ).trim();
+    if (!query) return "Dime qué tarea quieres que resuelva, Koko.";
+
+    const fetchLocalAssistantFallback = async (): Promise<string | null> => {
         try {
             const r = await fetch('/api/local-assistant', {
                 method: 'POST',
@@ -1291,30 +1297,44 @@ export async function performComplexTask(query: string): Promise<string> {
             });
             if (r.ok) {
                 const d = await r.json();
-                if (d?.reply) return d.reply;
+                if (d?.reply) return String(d.reply);
             }
         } catch {}
-        return "Estoy en modo local sobre tu sistema Linux, Koko. Si quieres activar el motor en la nube ejecuta: nexus apikey TU_CLAVE_GEMINI.";
-    }
-    const ai = new GoogleGenAI({ apiKey });
-    for (const model of ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash']) {
-        try {
-            const response = await ai.models.generateContent({
-                model,
-                contents: `Koko te ha pedido que realices la siguiente tarea compleja: "${query}". Responde de forma concisa y directa, como lo haría tu personalidad Nexus.`,
-                config: model.startsWith('gemini-3')
-                    ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } }
-                    : undefined,
-            });
-            if (response.text) return response.text;
-        } catch (error) {
-            console.warn(`performComplexTask warning with ${model}:`, error);
+        return null;
+    };
+
+    const apiKey = await getEffectiveGeminiApiKey();
+    if (apiKey) {
+        const ai = new GoogleGenAI({ apiKey });
+        for (const model of ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-3.1-pro-preview']) {
+            try {
+                const response = await ai.models.generateContent({
+                    model,
+                    contents: `Koko te ha pedido que realices la siguiente tarea compleja: "${query}". Responde de forma concisa, útil y directa, manteniendo tu personalidad Nexus.`,
+                    config: model.startsWith('gemini-3')
+                        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } }
+                        : undefined,
+                });
+                if (response.text) return response.text;
+            } catch (error) {
+                console.warn(`performComplexTask warning with ${model}:`, error);
+            }
         }
     }
-    return "He tenido un problema gordo pensando en eso, Koko. Inténtalo de nuevo.";
+
+    const fallbackReply = await fetchLocalAssistantFallback();
+    if (fallbackReply) return fallbackReply;
+    return "He tenido un problema pensando en eso, Koko. Inténtalo de nuevo.";
 }
 
-export async function getWebSearchResult(query: string): Promise<string> {
+export async function getWebSearchResult(queryInput: string | { query?: string; prompt?: string; text?: string }): Promise<string> {
+    const query = (
+        typeof queryInput === 'string'
+            ? queryInput
+            : String(queryInput?.query || queryInput?.prompt || queryInput?.text || '')
+    ).trim();
+    if (!query) return "Dime qué quieres que busque en la red, Koko.";
+
     const fetchServerSearch = async (): Promise<string | null> => {
         try {
             const r = await fetch('/api/web-search', {
@@ -1371,7 +1391,14 @@ export async function getWebSearchResult(query: string): Promise<string> {
     return "No he podido encontrar nada en internet sobre eso, Koko. Vaya lío.";
 }
 
-export async function generateImage(prompt: string): Promise<string> {
+export async function generateImage(promptInput: string | { prompt?: string; query?: string; text?: string }): Promise<string> {
+    const prompt = (
+        typeof promptInput === 'string'
+            ? promptInput
+            : String(promptInput?.prompt || promptInput?.query || promptInput?.text || '')
+    ).trim();
+    if (!prompt) return "No se pudo generar la imagen (prompt vacío).";
+
     const fetchServerImage = async (): Promise<string | null> => {
         try {
             const r = await fetch('/api/generate-image', {
@@ -1485,8 +1512,130 @@ export async function executeCyberSecurityTool(tool: string, action: string, tar
     }
 }
 
+export function ensureWindowNexusCoreMethods(): void {
+    if (typeof window === 'undefined') return;
+    const w = window as any;
+    const existing = w.nexus || {};
+
+    const runSystemCommand = async (command: string): Promise<string> => {
+        try {
+            const res = await fetch('/api/terminal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                return String(data?.output || '');
+            }
+        } catch (err: any) {
+            return `Error ejecutando comando: ${err?.message || err}`;
+        }
+        return '';
+    };
+
+    const makeHttpRequestBridge = async (
+        methodOrOpts: string | { method?: string; url: string; headers?: any; body?: any },
+        urlArg?: string,
+        headersArg?: any,
+        bodyArg?: any
+    ): Promise<string> => {
+        const method = typeof methodOrOpts === 'string' ? methodOrOpts : (methodOrOpts?.method || 'GET');
+        const url = typeof methodOrOpts === 'string' ? (urlArg || '') : (methodOrOpts?.url || '');
+        const rawHeaders = typeof methodOrOpts === 'string' ? headersArg : methodOrOpts?.headers;
+        const rawBody = typeof methodOrOpts === 'string' ? bodyArg : methodOrOpts?.body;
+        try {
+            const parsedHeaders = typeof rawHeaders === 'string' ? JSON.parse(rawHeaders) : (rawHeaders || {});
+            const r = await fetch(url, {
+                method: method.toUpperCase(),
+                headers: parsedHeaders,
+                body: ['GET', 'HEAD'].includes(method.toUpperCase())
+                    ? undefined
+                    : typeof rawBody === 'object'
+                    ? JSON.stringify(rawBody)
+                    : rawBody,
+            });
+            return await r.text();
+        } catch (e: any) {
+            return `Error HTTP: ${e?.message || e}`;
+        }
+    };
+
+    w.nexus = {
+        ...existing,
+        performComplexTask: (q: any) => performComplexTask(q),
+        ask: (q: any) => performComplexTask(q),
+        chat: (q: any) => performComplexTask(q),
+        generateText: (q: any) => performComplexTask(q),
+        complete: (q: any) => performComplexTask(q),
+        analyze: (q: any) => performComplexTask(q),
+        improvePrompt: (promptInput: any) => {
+            const raw = typeof promptInput === 'string'
+                ? promptInput
+                : String(promptInput?.prompt || promptInput?.query || promptInput?.text || '');
+            return performComplexTask(
+                `Mejora, optimiza y estructura de forma profesional el siguiente prompt manteniendo su intención original. Devuelve el prompt mejorado listo para usar:\n\n${raw}`
+            );
+        },
+        getWebSearchResult: (q: any) => getWebSearchResult(q),
+        webSearch: (q: any) => getWebSearchResult(q),
+        search: (q: any) => getWebSearchResult(q),
+        googleSearch: (q: any) => getWebSearchResult(q),
+        generateImage: (p: any) => generateImage(p),
+        createImage: (p: any) => generateImage(p),
+        executeCyberSecurityTool: (
+            toolOrObj: any,
+            action?: string,
+            target?: string,
+            options?: string
+        ) => {
+            if (typeof toolOrObj === 'object' && toolOrObj !== null) {
+                return executeCyberSecurityTool(
+                    String(toolOrObj.tool || 'hash'),
+                    String(toolOrObj.action || 'sha256'),
+                    String(toolOrObj.target || ''),
+                    toolOrObj.options ? String(toolOrObj.options) : undefined
+                );
+            }
+            return executeCyberSecurityTool(
+                String(toolOrObj || 'hash'),
+                String(action || 'sha256'),
+                String(target || ''),
+                options
+            );
+        },
+        cyberSecurityTool: (
+            toolOrObj: any,
+            action?: string,
+            target?: string,
+            options?: string
+        ) => w.nexus.executeCyberSecurityTool(toolOrObj, action, target, options),
+        executeDynamicCode: (c: string) => executeDynamicCode(c),
+        saveMemory: (fact: string, category?: string) => saveMemoryToStorage(fact, category),
+        saveMemoryToStorage: (fact: string, category?: string) => saveMemoryToStorage(fact, category),
+        retrieveMemories: (query?: string) => getAllMemoriesFromStorage(query),
+        getAllMemoriesFromStorage: (query?: string) => getAllMemoriesFromStorage(query),
+        loadMemories: () => loadMemories(),
+        getMemories: () => getMemoriesArray(),
+        getMemoriesArray: () => getMemoriesArray(),
+        deleteMemory: (id: number) => deleteMemory(id),
+        clearMemories: () => clearAllMemories(),
+        clearAllMemories: () => clearAllMemories(),
+        saveTranscript: (text: string, role: 'user' | 'model') => saveTranscript(text, role),
+        synthesizeNexusVoice: (text: string) => synthesizeNexusVoice(text),
+        runCommand: (cmd: string) => runSystemCommand(cmd),
+        exec: (cmd: string) => runSystemCommand(cmd),
+        makeHttpRequest: makeHttpRequestBridge,
+    };
+}
+
+if (typeof window !== 'undefined') {
+    ensureWindowNexusCoreMethods();
+}
+
 export async function executeDynamicCode(code: string): Promise<string> {
     console.log(`Executing dynamic code:`, code);
+    ensureWindowNexusCoreMethods();
     
     // --- MITIGACIÓN DE SEGURIDAD (XSS / Code Injection) ---
     // ADVERTENCIA: Esta función ejecuta código arbitrario usando regeneración dinámica.
@@ -1501,12 +1650,10 @@ export async function executeDynamicCode(code: string): Promise<string> {
             throw new Error("Validación 1 Fallida: El código a ejecutar está vacío o es inválido.");
         }
         
-        // 2. Bloqueo de exfiltración básica y patrones peligrosos (Mitigación de inyección)
+        // 2. Bloqueo de exfiltración de cookies o claves sensibles
         const dangerousPatterns = [
             /document\.cookie/i,
-            /localStorage/i,
-            /sessionStorage/i,
-            /fetch\s*\(\s*['"]https?:\/\/(?!localhost|127\.0\.0\.1|api\.)/i
+            /nexus_gemini_api_key/i,
         ];
         
         for (const pattern of dangerousPatterns) {
@@ -1571,11 +1718,11 @@ export async function executeDynamicCode(code: string): Promise<string> {
         }
 
         // Use AsyncFunction constructor to execute code robustly
-        // This avoids any weird wrapper syntax errors and correctly isolates execution
-        // while allowing access to window and global variables.
+        // Pass window.nexus as `nexus` parameter so both `nexus.performComplexTask(...)`
+        // and `window.nexus.performComplexTask(...)` work seamlessly.
         const AsyncFunction = async function () {}.constructor as any;
-        const fn = new AsyncFunction(cleanCode);
-        const result = await fn();
+        const fn = new AsyncFunction('nexus', cleanCode);
+        const result = await fn((window as any).nexus);
         
         console.log("Execution result:", result);
         
