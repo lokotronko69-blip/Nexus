@@ -6,9 +6,10 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
+import { GoogleGenAI } from '@google/genai';
 import { startHardwareMonitor, getHardwareSnapshot } from './services/hardwareMonitor';
 
-const NEXUS_VERSION = '1.2.2';
+const NEXUS_VERSION = '1.2.3';
 
 interface NexusVaultData {
   version: string;
@@ -780,22 +781,47 @@ async function startServer() {
       return;
     }
 
-    // 1. Try natural Spanish female TTS via Google Translate TTS endpoint (works on Kali Linux without API key)
+    // 1. Try natural Spanish female TTS via Google Translate TTS endpoint (supports full multi-sentence replies)
     try {
-      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=es&client=tw-ob&q=${encodeURIComponent(text.slice(0, 200))}`;
-      const gRes = await fetch(ttsUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-        },
-        signal: AbortSignal.timeout(2500),
-      });
-      if (gRes.ok) {
+      const splitIntoTtsChunks = (raw: string, maxLen = 180): string[] => {
+        const result: string[] = [];
+        let remaining = raw.replace(/\s+/g, ' ').trim();
+        while (remaining.length > maxLen) {
+          let cut = remaining.lastIndexOf('. ', maxLen);
+          if (cut < 40) cut = remaining.lastIndexOf(', ', maxLen);
+          if (cut < 40) cut = remaining.lastIndexOf('; ', maxLen);
+          if (cut < 40) cut = remaining.lastIndexOf(' ', maxLen);
+          if (cut <= 0) cut = maxLen;
+          result.push(remaining.slice(0, cut + 1).trim());
+          remaining = remaining.slice(cut + 1).trim();
+        }
+        if (remaining) result.push(remaining);
+        return result.slice(0, 4);
+      };
+
+      const segments = splitIntoTtsChunks(text);
+      const mp3Buffers: Buffer[] = [];
+      for (const seg of segments) {
+        const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=es&client=tw-ob&q=${encodeURIComponent(seg)}`;
+        const gRes = await fetch(ttsUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+          },
+          signal: AbortSignal.timeout(2500),
+        });
+        if (!gRes.ok) {
+          mp3Buffers.length = 0;
+          break;
+        }
         const arrBuf = await gRes.arrayBuffer();
         if (arrBuf.byteLength > 256) {
-          res.setHeader('Content-Type', 'audio/mpeg');
-          res.send(Buffer.from(arrBuf));
-          return;
+          mp3Buffers.push(Buffer.from(arrBuf));
         }
+      }
+      if (mp3Buffers.length > 0) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.send(Buffer.concat(mp3Buffers));
+        return;
       }
     } catch {}
 
@@ -895,18 +921,50 @@ async function startServer() {
 
     const tmpWav = `/tmp/nexus-utt-${process.pid}-${Date.now()}.wav`;
     let transcript = '';
+    let srInstalled = false;
 
     try {
       const wavBuf = Buffer.from(audioWavBase64, 'base64');
-      fs.writeFileSync(tmpWav, wavBuf, { mode: 0o600 });
+      // If utterance is too short (< 0.25s of 16kHz 16-bit mono PCM), ignore noise
+      if (wavBuf.byteLength < 8000) {
+        res.json({ transcript: '', reply: '', ignore: true });
+        return;
+      }
 
-      // 1. Try Python speech_recognition (pre-installed on Kali/Debian via python3-speechrecognition)
-      if (fs.existsSync('/usr/bin/python3')) {
-        transcript = await new Promise<string>((resolve) => {
+      // 1. If a valid Gemini API key is configured on the server, transcribe via Gemini 2.5 Flash
+      const serverApiKey = getResolvedGeminiApiKey(true);
+      if (serverApiKey) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: serverApiKey });
+          const sttRes = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { inlineData: { mimeType: 'audio/wav', data: audioWavBase64 } },
+                  { text: 'Transcribe exactamente lo que dice la voz en español. Devuelve ÚNICAMENTE el texto transcrito sin comillas ni explicaciones. Si solo hay ruido o silencio, devuelve vacío.' },
+                ],
+              },
+            ],
+          });
+          transcript = (sttRes.text || '').trim();
+          srInstalled = true;
+        } catch {}
+      }
+
+      // 2. Try Python speech_recognition (pre-installed on Kali/Debian via python3-speechrecognition)
+      if (!transcript && fs.existsSync('/usr/bin/python3')) {
+        fs.writeFileSync(tmpWav, wavBuf, { mode: 0o600 });
+        const pyResult = await new Promise<{ installed: boolean; text: string }>((resolve) => {
           const pyCode = [
             'import sys',
             'try:',
             '    import speech_recognition as sr',
+            'except ImportError:',
+            '    print("__NO_SR__")',
+            '    sys.exit(0)',
+            'try:',
             '    r = sr.Recognizer()',
             '    with sr.AudioFile(sys.argv[1]) as source:',
             '        audio = r.record(source)',
@@ -917,12 +975,27 @@ async function startServer() {
           const out: Buffer[] = [];
           const p = spawn('/usr/bin/python3', ['-c', pyCode, tmpWav], { timeout: 5500 });
           p.stdout.on('data', d => out.push(Buffer.from(d)));
-          p.on('error', () => resolve(''));
-          p.on('close', () => resolve(Buffer.concat(out).toString('utf8').trim()));
+          p.on('error', () => resolve({ installed: false, text: '' }));
+          p.on('close', () => {
+            const raw = Buffer.concat(out).toString('utf8').trim();
+            if (raw === '__NO_SR__') {
+              resolve({ installed: false, text: '' });
+            } else {
+              resolve({ installed: true, text: raw });
+            }
+          });
         });
+        srInstalled = srInstalled || pyResult.installed;
+        transcript = pyResult.text;
       }
     } catch {} finally {
       try { if (fs.existsSync(tmpWav)) fs.unlinkSync(tmpWav); } catch {}
+    }
+
+    // If speech recognizer is installed and returned empty, it was just ambient noise/silence
+    if (srInstalled && !transcript) {
+      res.json({ transcript: '', reply: '', ignore: true });
+      return;
     }
 
     const reply = buildLocalAssistantReply(transcript || 'hola nexus');
@@ -946,6 +1019,7 @@ async function startServer() {
 
   // Stream live Nexus source code + precompiled dist bundle (.tar.gz) for automated Debian/Kali .deb package installer
   app.get('/api/source-bundle.tar.gz', (_req, res) => {
+    const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Disposition', 'attachment; filename="nexus-source.tar.gz"');
     const tarProc = spawn('tar', [
@@ -957,7 +1031,7 @@ async function startServer() {
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
       '.'
-    ], { cwd: process.cwd() });
+    ], { cwd: tarCwd });
 
     tarProc.stdout.pipe(res);
     tarProc.stderr.on('data', (data) => {
@@ -977,6 +1051,7 @@ async function startServer() {
   app.get('/api/updater-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
     const portParam = (req.query.port as string) || '3000';
+    const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
 
     const chunks: Buffer[] = [];
     const tarProc = spawn('tar', [
@@ -989,7 +1064,7 @@ async function startServer() {
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
       '.'
-    ], { cwd: process.cwd() });
+    ], { cwd: tarCwd });
 
     tarProc.stdout.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     tarProc.on('error', (err) => {
@@ -1179,11 +1254,13 @@ rollback_on_failure() {
 echo "[4/5] Aplicando intercambio atómico en \${INSTALL_DIR} (preservando .env y bóveda /opt/nexus/data)..."
 trap rollback_on_failure ERR
 
-if [ ! -d "\${INSTALL_DIR}/node_modules" ] || [ "\$OLD_PKG_HASH" != "\$NEW_PKG_HASH" ]; then
-  rm -rf "\${INSTALL_DIR}/node_modules"
-  mv "\${STAGING_DIR}/node_modules" "\${INSTALL_DIR}/node_modules"
-else
-  rm -rf "\${STAGING_DIR}/node_modules"
+if [ -d "\${STAGING_DIR}/node_modules" ]; then
+  if [ ! -d "\${INSTALL_DIR}/node_modules" ] || [ "\$OLD_PKG_HASH" != "\$NEW_PKG_HASH" ]; then
+    rm -rf "\${INSTALL_DIR}/node_modules"
+    mv "\${STAGING_DIR}/node_modules" "\${INSTALL_DIR}/node_modules"
+  else
+    rm -rf "\${STAGING_DIR}/node_modules"
+  fi
 fi
 
 # Copiar código y compilación nueva sin tocar .env ni data/
@@ -1258,6 +1335,7 @@ echo "==========================================================================
   app.get('/api/installer-payload', (req, res) => {
     const userParam = (req.query.user as string) || 'koko';
     const portParam = (req.query.port as string) || '3000';
+    const tarCwd = fs.existsSync('/opt/nexus/package.json') ? '/opt/nexus' : process.cwd();
 
     const chunks: Buffer[] = [];
     const tarProc = spawn('tar', [
@@ -1268,7 +1346,7 @@ echo "==========================================================================
       '--exclude=package-lock.json',
       '--exclude=bun.lock',
       '.'
-    ], { cwd: process.cwd() });
+    ], { cwd: tarCwd });
 
     tarProc.stdout.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     tarProc.on('error', (err) => {

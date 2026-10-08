@@ -12,6 +12,7 @@ export const SystemNotes: React.FC<SystemNotesProps> = ({ onClose, initialConten
     });
     const [copied, setCopied] = useState(false);
     const [saved, setSaved] = useState(false);
+    const [confirmClear, setConfirmClear] = useState(false);
 
     useEffect(() => {
         if (initialContent) {
@@ -122,15 +123,19 @@ export const SystemNotes: React.FC<SystemNotesProps> = ({ onClose, initialConten
                 <div className="flex items-center gap-2">
                     <button
                         onClick={() => {
-                            if (confirm('¿Vaciar el bloc de notas?')) {
-                                setContent('');
-                                localStorage.removeItem('nexus_system_notes');
+                            if (!confirmClear) {
+                                setConfirmClear(true);
+                                setTimeout(() => setConfirmClear(false), 3000);
+                                return;
                             }
+                            setConfirmClear(false);
+                            setContent('');
+                            localStorage.removeItem('nexus_system_notes');
                         }}
-                        className="text-zinc-500 hover:text-red-400 flex items-center gap-1 transition-colors"
+                        className={`flex items-center gap-1 transition-colors ${confirmClear ? 'text-red-400 font-bold' : 'text-zinc-500 hover:text-red-400'}`}
                     >
                         <Trash2 className="w-3 h-3" />
-                        <span>Limpiar</span>
+                        <span>{confirmClear ? '¿Confirmar limpiar?' : 'Limpiar'}</span>
                     </button>
                 </div>
             </div>

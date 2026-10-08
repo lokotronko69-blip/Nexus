@@ -1260,20 +1260,21 @@ export async function performComplexTask(query: string): Promise<string> {
         return "Estoy en modo local sobre tu sistema Linux, Koko. Si quieres activar el motor en la nube ejecuta: nexus apikey TU_CLAVE_GEMINI.";
     }
     const ai = new GoogleGenAI({ apiKey });
-    console.log(`Executing complex task with gemini-3.1-pro-preview for query: "${query}"`);
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3.1-pro-preview',
-            contents: `Koko te ha pedido que realices la siguiente tarea compleja: "${query}". Responde de forma concisa y directa, como lo haría tu personalidad Nexus.`,
-            config: {
-                thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
-            },
-        });
-        return response.text || "";
-    } catch (error) {
-        console.error("Error in performComplexTask:", error);
-        return "He tenido un problema gordo pensando en eso, Koko. Inténtalo de nuevo.";
+    for (const model of ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash']) {
+        try {
+            const response = await ai.models.generateContent({
+                model,
+                contents: `Koko te ha pedido que realices la siguiente tarea compleja: "${query}". Responde de forma concisa y directa, como lo haría tu personalidad Nexus.`,
+                config: model.startsWith('gemini-3')
+                    ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } }
+                    : undefined,
+            });
+            if (response.text) return response.text;
+        } catch (error) {
+            console.warn(`performComplexTask warning with ${model}:`, error);
+        }
     }
+    return "He tenido un problema gordo pensando en eso, Koko. Inténtalo de nuevo.";
 }
 
 export async function getWebSearchResult(query: string): Promise<string> {
@@ -1293,30 +1294,31 @@ export async function getWebSearchResult(query: string): Promise<string> {
         return "Modo local activo en Linux. Para búsquedas en la nube con Gemini, ejecuta: nexus apikey TU_CLAVE_GEMINI.";
     }
     const ai = new GoogleGenAI({ apiKey });
-    console.log(`Executing web search with gemini-3.8-flash for query: "${query}"`);
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: `Koko ha preguntado: "${query}". Busca en la web y dale una respuesta clara y concisa, al estilo Nexus.`,
-            config: {
-                tools: [{ googleSearch: {} }],
-            },
-        });
-        let result = response.text || "";
-        const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-        if (groundingChunks && groundingChunks.length > 0) {
-            const sources = groundingChunks
-                .map((chunk: any) => chunk.web?.uri)
-                .filter(Boolean);
-            if (sources.length > 0) {
-                result += `\n\n(Fuentes: ${[...new Set(sources)].join(', ')})`;
+    for (const model of ['gemini-3-flash-preview', 'gemini-2.5-flash']) {
+        try {
+            const response = await ai.models.generateContent({
+                model,
+                contents: `Koko ha preguntado: "${query}". Busca en la web y dale una respuesta clara y concisa, al estilo Nexus.`,
+                config: {
+                    tools: [{ googleSearch: {} }],
+                },
+            });
+            let result = response.text || "";
+            const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+            if (groundingChunks && groundingChunks.length > 0) {
+                const sources = groundingChunks
+                    .map((chunk: any) => chunk.web?.uri)
+                    .filter(Boolean);
+                if (sources.length > 0) {
+                    result += `\n\n(Fuentes: ${[...new Set(sources)].join(', ')})`;
+                }
             }
+            if (result) return result;
+        } catch (error) {
+            console.warn(`getWebSearchResult warning with ${model}:`, error);
         }
-        return result;
-    } catch (error) {
-        console.error("Error in getWebSearchResult:", error);
-        return "No he podido encontrar nada en internet sobre eso, Koko. Vaya lío.";
     }
+    return "No he podido encontrar nada en internet sobre eso, Koko. Vaya lío.";
 }
 
 export async function generateImage(prompt: string): Promise<string> {
@@ -1327,8 +1329,8 @@ export async function generateImage(prompt: string): Promise<string> {
     const ai = new GoogleGenAI({ apiKey });
     console.log(`Generating image for prompt: "${prompt}"`);
     
-    // Try gemini-3.1-flash-image first, fallback to gemini-3.1-flash-lite-image
-    for (const model of ['gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image']) {
+    // Try gemini-2.5-flash-image first, fallback to gemini-3.1-flash-image-preview
+    for (const model of ['gemini-2.5-flash-image', 'gemini-3.1-flash-image-preview']) {
         try {
             const response = await ai.models.generateContent({
                 model,

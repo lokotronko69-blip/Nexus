@@ -173,7 +173,10 @@ export const App: React.FC = () => {
     const autoStartedRef = useRef<boolean>(false);
     const localVoiceBusyRef = useRef<boolean>(false);
     const localGreetedRef = useRef<boolean>(false);
+    const nexusSpeakingUntilRef = useRef<number>(0);
+    const lastVoiceCommandAtRef = useRef<number>(0);
     const [typedCommandBuffer, setTypedCommandBuffer] = useState<string>('');
+    const [confirmClearMemories, setConfirmClearMemories] = useState<boolean>(false);
 
     const matchAndApplyPanelCommand = useCallback((rawInput: string): string | null => {
         const lower = (rawInput || '').toLowerCase().trim();
@@ -328,6 +331,7 @@ export const App: React.FC = () => {
 
             source.addEventListener('ended', () => {
                 sourcesRef.current.delete(source);
+                nexusSpeakingUntilRef.current = Date.now() + 550;
                 if (sourcesRef.current.size === 0) {
                     setNexusStatus('LISTENING');
                 }
@@ -335,6 +339,7 @@ export const App: React.FC = () => {
 
             source.start(nextStartTimeRef.current);
             nextStartTimeRef.current += audioBuffer.duration;
+            nexusSpeakingUntilRef.current = Date.now() + Math.ceil((nextStartTimeRef.current - outputAudioContext.currentTime) * 1000) + 550;
             sourcesRef.current.add(source);
             return true;
         } catch (e) {
@@ -711,6 +716,7 @@ export const App: React.FC = () => {
                 if (!cleanText) return "Sin texto.";
                 setNexusStatus('SPEAKING');
                 const fallbackDuration = Math.min(Math.max(cleanText.length * 60, 2400), 10000);
+                nexusSpeakingUntilRef.current = Date.now() + fallbackDuration;
                 const fallbackTimer = window.setTimeout(() => {
                     if (sourcesRef.current.size === 0) {
                         setNexusStatus(prev => (prev === 'SPEAKING' ? 'LISTENING' : prev));
@@ -749,9 +755,11 @@ export const App: React.FC = () => {
                             src.buffer = decoded;
                             src.connect(analyser);
                             sourcesRef.current.add(src);
+                            nexusSpeakingUntilRef.current = Date.now() + Math.ceil(decoded.duration * 1000) + 550;
                             setNexusStatus('SPEAKING');
                             src.onended = () => {
                                 sourcesRef.current.delete(src);
+                                nexusSpeakingUntilRef.current = Date.now() + 550;
                                 clearTimeout(fallbackTimer);
                                 if (sourcesRef.current.size === 0) {
                                     setNexusStatus('LISTENING');
@@ -770,6 +778,7 @@ export const App: React.FC = () => {
                             window.speechSynthesis.cancel();
                             const voices = window.speechSynthesis.getVoices();
                             if (!voices || voices.length === 0) {
+                                nexusSpeakingUntilRef.current = Date.now() + 400;
                                 return;
                             }
                             const utterance = new SpeechSynthesisUtterance(cleanText);
@@ -787,6 +796,7 @@ export const App: React.FC = () => {
                                 setNexusStatus('SPEAKING');
                             };
                             utterance.onend = () => {
+                                nexusSpeakingUntilRef.current = Date.now() + 550;
                                 clearTimeout(fallbackTimer);
                                 setNexusStatus('LISTENING');
                             };
@@ -2149,6 +2159,12 @@ export const App: React.FC = () => {
     }, [lmStudioUrl, ollamaUrl]);
 
     const startOfflineRecognition = useCallback(() => {
+        // On Linux (Debian / Kali), Chromium's webkitSpeechRecognition lacks Google Speech API keys
+        // and contends with ALSA/PipeWire mic streams. When our WebAudio VAD stream is active, rely on VAD.
+        const isLinux = typeof navigator !== 'undefined' && /\bLinux\b/i.test(navigator.userAgent || '');
+        if (isLinux && streamRef.current && streamRef.current.getAudioTracks().length > 0) {
+            return;
+        }
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
         if (!SpeechRecognition) {
             return;
@@ -2168,7 +2184,8 @@ export const App: React.FC = () => {
 
         recognition.onresult = async (event: any) => {
             const transcript = event.results?.[0]?.[0]?.transcript;
-            if (transcript) {
+            if (transcript && Date.now() - lastVoiceCommandAtRef.current > 1500) {
+                lastVoiceCommandAtRef.current = Date.now();
                 await processLocalCommand(transcript);
             }
         };
@@ -2401,11 +2418,11 @@ export const App: React.FC = () => {
                     const isLocalMode = Boolean((sessionRef.current as any)?.isLocalSession);
                     if (isLocalMode) {
                         // In Kali Linux / Debian Local Mode, browser webkitSpeechRecognition is often unavailable
-                        // (Chromium lacks Google Speech API keys, Firefox ESR lacks SpeechRecognition).
-                        // Use real-time WebAudio VAD to capture Koko's voice utterances and process via /api/local-voice-turn.
-                        if (recognitionRef.current) return;
+                        // or silently dead (Chromium lacks Google Speech API keys, Firefox ESR lacks SpeechRecognition).
+                        // Always use real-time WebAudio VAD to capture Koko's voice utterances and process via /api/local-voice-turn.
                         const nexusCurrentlySpeaking =
                             sourcesRef.current.size > 0 ||
+                            Date.now() < nexusSpeakingUntilRef.current ||
                             Boolean('speechSynthesis' in window && window.speechSynthesis.speaking);
                         if (nexusCurrentlySpeaking || localVoiceBusyRef.current) {
                             isCapturingUtterance = false;
@@ -2441,7 +2458,7 @@ export const App: React.FC = () => {
                             voicedChunksCount = 0;
                             silenceChunksCount = 0;
 
-                            if (voiced >= 3) {
+                            if (voiced >= 3 && Date.now() - lastVoiceCommandAtRef.current > 1500) {
                                 localVoiceBusyRef.current = true;
                                 setNexusStatus('THINKING');
                                 const audioWavBase64 = encodeWavFromChunks(captured, targetRate);
@@ -2452,9 +2469,15 @@ export const App: React.FC = () => {
                                 })
                                     .then(r => (r.ok ? r.json() : null))
                                     .then(async (data) => {
+                                        if (data?.ignore) {
+                                            setNexusStatus('LISTENING');
+                                            return;
+                                        }
                                         if (data?.transcript && String(data.transcript).trim()) {
+                                            lastVoiceCommandAtRef.current = Date.now();
                                             await processLocalCommand(String(data.transcript).trim());
                                         } else if (data?.reply) {
+                                            lastVoiceCommandAtRef.current = Date.now();
                                             saveTranscript(data.reply, 'model');
                                             if ((window as any).nexus?.speak) {
                                                 (window as any).nexus.speak(data.reply);
@@ -2779,10 +2802,14 @@ export const App: React.FC = () => {
     };
 
     const handleClearMemories = async () => {
-        if (window.confirm("¿Estás seguro de que quieres borrar TODAS las memorias de Nexus? Esto no se puede deshacer.")) {
-            if (await clearAllMemories()) {
-                setMemories([]);
-            }
+        if (!confirmClearMemories) {
+            setConfirmClearMemories(true);
+            setTimeout(() => setConfirmClearMemories(false), 3500);
+            return;
+        }
+        setConfirmClearMemories(false);
+        if (await clearAllMemories()) {
+            setMemories([]);
         }
     };
 
@@ -3072,10 +3099,14 @@ export const App: React.FC = () => {
                             <div className="p-4 border-t border-zinc-800 bg-zinc-900/50 flex justify-end">
                                 <button 
                                     onClick={handleClearMemories}
-                                    className="px-4 py-2 text-sm text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded-lg transition-colors flex items-center gap-2"
+                                    className={`px-4 py-2 text-sm rounded-lg transition-colors flex items-center gap-2 ${
+                                        confirmClearMemories
+                                            ? 'bg-red-600 text-white font-bold'
+                                            : 'text-red-400 hover:text-red-300 hover:bg-red-400/10'
+                                    }`}
                                 >
                                     <Trash2 size={16} />
-                                    Borrar Todo
+                                    {confirmClearMemories ? '¿Confirmar Borrar Todo?' : 'Borrar Todo'}
                                 </button>
                             </div>
                         )}
